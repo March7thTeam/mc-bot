@@ -5,12 +5,22 @@ const fs = require('node:fs')
 const vm = require('node:vm')
 const path = require('node:path')
 const { EventEmitter } = require('node:events')
+const { Vec3 } = require('vec3')
+const { PRIORITIES } = require('../runtime')
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
 const flush = async () => { for (let n = 0; n < 8; n++) await new Promise(setImmediate) }
+const cleanup = (t, h, ...waits) => t.after(async () => {
+  h.inner('director').stop()
+  h.inner('runtime').cancel()
+  for (const wait of waits) wait.resolve()
+  await flush()
+})
 
-function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions } = {}) {
-  const sent = [], marks = [], calls = [], logs = []
+function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions, env = {}, savedGoal, agentApi = false } = {}) {
+  const sent = [], marks = [], calls = [], logs = [], movements = []
   const engines = []
+  let apiHandlers = null
+  const timers = [], intervals = []
   const bot = new EventEmitter()
   const pos = { x: 1, y: 64, z: 2, clone() { return { ...this } } }
   Object.assign(bot, {
@@ -19,12 +29,12 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     registry: { itemsByName: {}, blocksByName: {}, blocksArray: [] }, inventory: { items: () => [] },
     chat: (s) => sent.push(s), loadPlugin() {}, findBlocks: () => [], nearestEntity: () => null,
     pvp: { stop() {}, attack() {} }, hawkEye: { stop() {} }, collectBlock: { cancelTask: async () => {} },
-    pathfinder: { setMovements() {}, setGoal(g) { this.goal = g; calls.push(['goal', g]) }, isMoving: () => false, goto: async () => {} },
+    pathfinder: { setMovements(m) { this.currentMove = m; movements.push(m) }, setGoal(g) { this.goal = g; calls.push(['goal', g]) }, isMoving: () => false, goto: async () => {} },
     stopDigging() {}, clearControlStates() {}, equip: () => calls.push('equip'), quit() {},
     look: async (...args) => calls.push(['look', ...args]), elytraFly: async () => calls.push('glide'),
   })
   class Movements {
-    constructor() { this.blocksCantBreak = new Set(); this.exclusionAreasPlace = []; this.scafoldingBlocks = []; this.liquids = new Set() }
+    constructor() { this.canDig = true; this.blocksCantBreak = new Set(); this.exclusionAreasPlace = []; this.scafoldingBlocks = []; this.liquids = new Set() }
     getNeighbors() { return [] }
     getBlock() { return {} }
     getMoveForward() {}
@@ -37,8 +47,9 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     minecrafthawkeye: { default() {} }, './fabric': { setupFabric() {}, MODDED_BLOCK_ID: 100000 },
     './modes': { createModes: () => ({ list() {}, describe: () => [], set: () => true }) },
     './combat': { createCombat: () => ({ stop() {}, active: () => false, equipWeapon() {} }) },
+    './autonomy': { createDirector: (opts) => require('../autonomy').createDirector({ ...opts, log: (line) => logs.push(line) }) },
     './memory': { list: () => [], add() {} },
-    './storage': { readJSON: (_file, fallback) => fallback, writeJSON() {} }, // 别把测试目标写进真实 data/goal.json
+    './storage': { readJSON: (file, fallback) => savedGoal && file.endsWith('/goal.json') ? savedGoal : fallback, writeJSON() {} }, // 别把测试目标写进真实 data/goal.json
     './ai': { createAI: () => ({ ask: (...args) => { calls.push(['ask', args[0]]); return ask(...args) }, cancel() {}, statistics: () => ({}) }) },
     './skills': { createSkills: (_bot, ctx) => ({
       commands: {
@@ -64,17 +75,28 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     return engine
   } }
   const root = path.resolve(__dirname, '..')
+  if (agentApi) mods['./agent-api'] = {
+    createEventLog: require('../agent-api').createEventLog,
+    createAgentApi: ({ handlers }) => { apiHandlers = handlers },
+  }
   if (extensions) mods['./mods'] = { createMods: (opts) => require('../mods').createMods({ ...opts, defs: extensions, log: (...a) => logs.push(a.join(' ')) }) }
   const context = vm.createContext({
     require: (name) => mods[name] || (name === 'vec3' || require('node:module').isBuiltin(name) ? require(name) : require(path.resolve(root, name))),
     console: { log: (...args) => logs.push(args.join(' ')) },
-    process: { env: { DEEPSEEK_API_KEY: 'unit-test-placeholder' }, on() {}, exit() { throw new Error('unexpected process exit') } },
-    setTimeout: (fn, ms) => fastGoalDelays && ms === 1000 ? setImmediate(fn) : 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {}, Date, Promise, Buffer, __dirname: root,
+    process: { env: { DEEPSEEK_API_KEY: 'unit-test-placeholder', ...(agentApi ? { MC_AGENT_PORT: '25599', MC_AGENT_TOKEN: 'unit-test-token-at-least-24-characters' } : {}), ...env }, on() {}, exit() { throw new Error('unexpected process exit') } },
+    setTimeout: (fn, ms) => {
+      if (fastGoalDelays && ms === 1000) return setImmediate(fn)
+      const timer = { fn, ms, cancelled: false, unref() {} }; timers.push(timer); return timer
+    },
+    clearTimeout: (timer) => { if (timer) timer.cancelled = true },
+    setInterval: (fn, ms) => { const timer = { fn, ms, cancelled: false, unref() {} }; intervals.push(timer); return timer },
+    clearInterval: (timer) => { if (timer) timer.cancelled = true }, Date, Promise, Buffer, __dirname: root,
   })
   vm.runInContext(fs.readFileSync(path.join(root, 'bot.js'), 'utf8'), context, { filename: 'bot.js' })
+  if (agentApi) vm.runInContext('startAgentApi()', context)
   bot.emit('spawn')
   sent.length = 0
-  return { bot, sent, marks, calls, logs, engines, readGoal: () => vm.runInContext('goal', context), inner: (name) => vm.runInContext(name, context) }
+  return { bot, sent, marks, calls, logs, movements, engines, timers, intervals, apiHandlers, readGoal: () => vm.runInContext('goal', context), inner: (name) => vm.runInContext(name, context) }
 }
 
 test('真实聊天入口拒绝原型名、保护最终片段，之后合法玩家仍可控制', async () => {
@@ -139,6 +161,335 @@ test('stop 后旧任务未收尾前拒绝新工作，旧清理不影响后续新
   await flush()
   assert.deepEqual(h.marks, [['Player', 'ready']])
 })
+
+test('嵌套 runTask 只由最外层持有任务名和移动配置', async (t) => {
+  const h = harness(), wait = deferred(), run = h.inner('runTask')
+  cleanup(t, h, wait)
+  const outer = run('outer', async () => { await run('inner', async () => {}); await wait.promise })
+  await flush()
+  assert.equal(h.inner('task'), 'outer')
+  assert.equal(h.inner('runtime').status().name, 'outer')
+  assert.equal(h.bot.pathfinder.currentMove.canDig, true)
+  assert.equal(h.logs.some((line) => line === '[task] start inner'), false)
+  wait.resolve()
+  await outer
+  assert.equal(h.inner('task'), null)
+  assert.equal(h.bot.pathfinder.currentMove.canDig, false)
+})
+
+test('自主收尾完成后才开启新玩家任务，旧清理不能切回安全移动', async (t) => {
+  const oldWait = deferred(), playerWait = deferred()
+  const h = harness({ routeHook: () => playerWait.promise })
+  cleanup(t, h, oldWait, playerWait)
+  const old = h.inner('runTask')('auto-test', () => oldWait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+  h.bot.emit('chat', 'Player', 'bot goto 10 64 10')
+  await flush()
+  oldWait.resolve()
+  await old
+  await flush()
+  assert.equal(h.inner('runtime').status().name, '赶路')
+  assert.equal(h.inner('task'), '赶路')
+  assert.equal(h.bot.pathfinder.currentMove.canDig, true)
+  playerWait.resolve({ ok: true, kind: 'travel', transport: 'walk', reached: true, position: { x: 10, y: 64, z: 10 } })
+  await flush()
+})
+
+for (const command of ['帮我记下位置', 'follow', 'run handoff']) {
+  test(`玩家 ${command} 从统一入口抢占自主并真正执行`, async (t) => {
+    const wait = deferred()
+    const h = harness({ ask: async () => ({ reply: '', actions: [{ cmd: 'mark', args: ['交接'] }], done: true }) })
+    cleanup(t, h, wait)
+    h.bot.players.Player = { entity: { position: new Vec3(2, 64, 2) } }
+    h.inner('workflows').set('handoff', require('../workflows').validate({ id: 'handoff', steps: [{ do: 'mark', args: ['交接'] }] }))
+    const old = h.inner('runTask')('auto-test', () => wait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+    h.bot.emit('chat', 'Player', `bot ${command}`)
+    await flush()
+    assert.deepEqual(h.marks, [])
+    wait.resolve()
+    await old
+    await flush()
+    assert.equal(h.sent.some((line) => /上一个任务还在/.test(line)), false)
+    if (command === 'follow') {
+      assert.equal(h.inner('followTarget'), 'Player')
+      assert.equal(h.inner('autonomyState')().busy, true)
+    } else assert.deepEqual(h.marks, [['Player', '交接']], JSON.stringify({ sent: h.sent, logs: h.logs, calls: h.calls }))
+  })
+}
+
+test('并发玩家抢占自主时后到请求入队，stop清队列并取消交接中的所有旧请求', async (t) => {
+  const oldWait = deferred(), playerWait = deferred()
+  const h = harness({ routeHook: () => playerWait.promise })
+  cleanup(t, h, oldWait, playerWait)
+  const old = h.inner('runTask')('auto-test', () => oldWait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+  h.bot.emit('chat', 'First', 'bot goto 10 64 10')
+  h.bot.emit('chat', 'Second', 'bot mark second')
+  await flush()
+  assert.equal(h.inner('runtime').generation(), 1)
+  oldWait.resolve()
+  await old
+  await flush()
+  assert.equal(h.inner('queue').length, 1)
+  assert.deepEqual(h.marks, [])
+  h.bot.emit('chat', 'Player', 'bot stop')
+  await flush()
+  assert.equal(h.inner('queue').length, 0)
+  playerWait.resolve({ ok: false, stopped: true })
+  await flush()
+  assert.deepEqual(h.marks, [])
+})
+
+for (const stop of ['stop', 'halt']) {
+  test(`交接中 ${stop}：${stop === 'halt' ? '保留' : '取消'}等待玩家，director保持停止`, async (t) => {
+    const wait = deferred(), h = harness()
+    cleanup(t, h, wait)
+    const d = h.inner('director')
+    d.start()
+    const old = h.inner('runTask')('auto-test', () => wait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+    h.bot.emit('chat', 'Player', 'bot mark handoff')
+    await flush()
+    h.bot.emit('chat', 'Player', `bot ${stop}`)
+    await flush()
+    assert.equal(d.enabled(), false)
+    wait.resolve()
+    await old
+    await flush()
+    assert.deepEqual(h.marks, stop === 'halt' ? [['Player', 'handoff']] : [])
+    assert.equal(h.inner('task'), null)
+    assert.equal(h.inner('busyReason')(), null)
+  })
+}
+
+test('跟随、站岗、进食、睡眠、容器和自卫均阻止日程开工', async () => {
+  const h = harness()
+  const state = h.inner('autonomyState')
+  h.bot.players.Player = { entity: { position: { x: 2, y: 64, z: 2 } } }
+  h.bot.emit('chat', 'Player', 'bot follow')
+  await flush()
+  assert.equal(state().busy, true)
+  h.bot.emit('chat', 'Player', 'bot stay')
+  await flush()
+  assert.equal(state().busy, true)
+  h.bot.emit('chat', 'Player', 'bot stop')
+  await flush()
+  assert.equal(state().busy, false)
+  h.inner('eating = true')
+  assert.equal(state().busy, true)
+  h.inner('eating = false')
+  h.bot.currentWindow = {}
+  assert.equal(state().busy, true)
+  h.bot.currentWindow = null
+  h.bot.isSleeping = true
+  assert.equal(state().busy, true)
+  h.bot.isSleeping = false
+  h.inner('combat').active = () => true
+  assert.equal(state().busy, true)
+})
+
+for (const command of ['stop', 'halt']) {
+  test(`启动窗口内 ${command} 会撤销迟到的自主启用定时器`, async () => {
+    const h = harness({ env: { MC_AUTONOMY: 'on' } })
+    const startup = h.timers.find((timer) => String(timer.fn).includes('director.start()'))
+    assert.ok(startup)
+    h.bot.emit('chat', 'Player', `bot ${command}`)
+    await flush()
+    assert.equal(startup.cancelled, true)
+    assert.equal(h.inner('director').enabled(), false)
+  })
+}
+
+test('日程中断写真实审计且不消耗预算，halt后任务名归零', async (t) => {
+  const wait = deferred(), h = harness()
+  cleanup(t, h, wait)
+  h.inner('commands').chop = () => h.inner('runTask')('auto-test', () => wait.promise)
+  const d = h.inner('director')
+  d.start()
+  const action = d.tick()
+  await flush()
+  h.bot.emit('chat', 'Player', 'bot halt')
+  await flush()
+  wait.resolve()
+  await action
+  assert.equal(d.budget().used, 0)
+  assert.equal(h.inner('task'), null)
+  assert.ok(h.logs.some((line) => /\[auto\].*"result":"interrupted"/.test(line)))
+})
+
+test('重启目标恢复窗口优先于日程，stop后旧恢复不会复活', async () => {
+  const h = harness({ env: { MC_AUTONOMY: 'on' }, savedGoal: { text: '旧目标', starter: 'Player', startedAt: Date.now() } })
+  const d = h.inner('director')
+  assert.equal(h.inner('autonomyState')().busy, true)
+  d.start()
+  assert.equal(await d.tick(), null)
+  h.bot.emit('chat', 'Player', 'bot stop')
+  await flush()
+  h.timers.find((timer) => String(timer.fn).includes('restoringGoal !== g')).fn()
+  await flush()
+  assert.equal(h.readGoal(), null)
+  assert.equal(h.calls.some((call) => Array.isArray(call) && call[0] === 'ask'), false)
+})
+
+test('新的玩家目标会撤销旧的待恢复目标', async (t) => {
+  const wait = deferred()
+  const h = harness({ ask: () => wait.promise, savedGoal: { text: '旧目标', starter: 'Player', startedAt: Date.now() } })
+  cleanup(t, h, wait)
+  h.bot.emit('chat', 'Player', 'bot goal 新目标')
+  await flush()
+  assert.equal(h.inner('restoringGoal'), null)
+  h.bot.emit('chat', 'Player', 'bot stop')
+  wait.resolve({ reply: '', actions: [], done: true })
+  await flush()
+})
+
+test('legacy autoThink 的在途模型回复被 halt 失效，玩家AI仍保留', async (t) => {
+  const wait = deferred(), h = harness({ ask: () => wait.promise })
+  cleanup(t, h, wait)
+  h.inner('auto = true; autoOwner = "Player"')
+  const thinking = h.inner('autoThink')('空闲')
+  await flush()
+  assert.equal(h.inner('runtime').status().origin, 'auto')
+  h.bot.emit('chat', 'Player', 'bot halt')
+  await flush()
+  wait.resolve({ reply: '旧自主回复', actions: [{ cmd: 'mark', args: ['不该执行'] }], done: true })
+  await thinking
+  await flush()
+  assert.deepEqual(h.marks, [])
+  assert.equal(h.sent.includes('旧自主回复'), false)
+  assert.equal(h.sent.some((line) => /自主本来就是关/.test(line)), false)
+
+  const playerWait = deferred(), player = harness({ ask: () => playerWait.promise })
+  cleanup(t, player, playerWait)
+  player.bot.emit('chat', 'Player', 'bot 记位置')
+  await flush()
+  player.bot.emit('chat', 'Player', 'bot halt')
+  await flush()
+  playerWait.resolve({ reply: '', actions: [{ cmd: 'mark', args: ['玩家目标'] }], done: true })
+  await flush()
+  assert.deepEqual(player.marks, [['Player', '玩家目标']])
+})
+
+test('Agent API 的 halt 可越过忙碌门禁，只取消自主而保留玩家任务', async (t) => {
+  const wait = deferred(), h = harness({ agentApi: true })
+  cleanup(t, h, wait)
+  assert.ok(h.apiHandlers)
+  h.inner('director').start()
+  const auto = h.inner('runTask')('auto-test', () => wait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+  assert.equal((await h.apiHandlers.command({ cmd: 'halt', args: [], wait: true })).ok, true)
+  assert.equal(h.inner('director').enabled(), false)
+  wait.resolve()
+  assert.equal((await auto).stopped, true)
+
+  const playerWait = deferred()
+  cleanup(t, h, playerWait)
+  const player = h.inner('runTask')('player-test', () => playerWait.promise)
+  const generation = h.inner('runtime').generation()
+  assert.equal((await h.apiHandlers.command({ cmd: 'halt', args: [], wait: true })).ok, true)
+  assert.equal(h.inner('runtime').generation(), generation)
+  playerWait.resolve()
+  assert.equal((await player).ok, true)
+})
+
+test('聊天交接已收尾但尚未派发的微任务间隙 stop 仍能取消旧请求', async (t) => {
+  const wait = deferred(), h = harness(), runtime = h.inner('runtime')
+  cleanup(t, h, wait)
+  const old = runtime.runTask('auto-test', () => wait.promise, { priority: PRIORITIES.routine, origin: 'auto' })
+  const stop = () => h.inner('stopAll')('stop')
+  old.then(stop, stop)
+  h.bot.emit('chat', 'Player', 'bot mark 不该执行')
+  await flush()
+  wait.resolve()
+  await old.catch(() => {})
+  await flush()
+  assert.deepEqual(h.marks, [])
+})
+
+test('halt 自主飞行后仍持锁降落，玩家交接等确认落地后再执行', async (t) => {
+  const wait = deferred(), h = harness({ flightWait: wait })
+  cleanup(t, h, wait)
+  const auto = h.inner('runTask')('auto-flight', () => h.inner('commands').fly(null, ['家']), { priority: PRIORITIES.routine, origin: 'auto', safe: true })
+  await flush()
+  h.bot.emit('chat', 'Player', 'bot halt')
+  await flush()
+  assert.equal(h.engines.at(-1).engine.status().phase, 'LANDING')
+  h.bot.emit('chat', 'Player', 'bot mark 落地以后')
+  await flush()
+  assert.deepEqual(h.marks, [])
+  assert.equal(h.inner('runtime').busy(), true)
+  wait.resolve({ ok: false, reached: false, landed: true, position: { x: 10, y: 64, z: 0 }, reason: 'halt', rocketsUsed: 1 })
+  assert.equal((await auto).stopped, true)
+  await flush()
+  assert.deepEqual(h.marks, [['Player', '落地以后']])
+})
+
+test('legacy 自主 AI 复用同一owner执行任务和工作流时不等待自身空闲', async (t) => {
+  const h = harness({
+    ask: async () => ({ reply: '', actions: [{ cmd: 'goto', args: ['10', '64', '10'] }, { cmd: 'run', args: ['nested'] }], done: true }),
+    routeHook: async (target) => ({ ok: true, kind: 'travel', transport: 'walk', reached: true, position: target }),
+  })
+  cleanup(t, h)
+  h.inner('workflows').set('nested', require('../workflows').validate({ id: 'nested', ai: true, steps: [{ do: 'mark', args: ['完成'] }] }))
+  h.inner('auto = true; autoOwner = "Player"')
+  const thinking = h.inner('autoThink')('空闲')
+  await flush()
+  assert.deepEqual(h.marks, [['Player', '完成']])
+  assert.equal(h.inner('runtime').busy(), false)
+  await thinking
+})
+
+for (const autonomous of [true, false]) {
+  test(`${autonomous ? '自主' : '玩家'}工作流执行任务时，玩家新指令${autonomous ? '抢占' : '排队'}`, async (t) => {
+    const wait = deferred()
+    const h = harness({ taskWait: wait, ask: async () => ({ reply: '', actions: [{ cmd: 'run', args: ['yielding'] }], done: true }) })
+    cleanup(t, h, wait)
+    h.inner('workflows').set('yielding', require('../workflows').validate({ id: 'yielding', ai: true, steps: [{ do: 'smelt', args: ['raw_iron', '1'] }] }))
+    let thinking
+    if (autonomous) {
+      h.inner('auto = true; autoOwner = "Player"')
+      thinking = h.inner('autoThink')('空闲')
+    } else h.bot.emit('chat', 'Player', 'bot run yielding')
+    await flush()
+    assert.equal(h.inner('workflowActive'), 'yielding')
+    assert.equal(h.inner('runtime').status().origin, autonomous ? 'auto' : 'player')
+    h.bot.emit('chat', 'Player', 'bot mark 玩家请求')
+    await flush()
+    assert.equal(h.inner('runtime').generation(), autonomous ? 1 : 0)
+    assert.equal(h.inner('queue').length, autonomous ? 0 : 1)
+    wait.resolve()
+    if (thinking) await thinking
+    await flush()
+    if (!autonomous) {
+      h.intervals.find((timer) => String(timer.fn).includes('queue.shift()')).fn()
+      await flush()
+    }
+    assert.deepEqual(h.marks, [['Player', '玩家请求']])
+    assert.equal(h.calls.includes('equip'), !autonomous)
+  })
+}
+
+for (const autonomous of [true, false]) {
+  test(`${autonomous ? '自主' : '玩家'} AI 等待模型时，玩家新指令${autonomous ? '抢占且废弃旧响应' : '排队保留原响应'}`, async (t) => {
+    const wait = deferred(), h = harness({ ask: () => wait.promise })
+    cleanup(t, h, wait)
+    let thinking
+    if (autonomous) {
+      h.inner('auto = true; autoOwner = "Player"')
+      thinking = h.inner('autoThink')('空闲')
+    } else h.bot.emit('chat', 'Player', 'bot 帮我记位置')
+    await flush()
+    assert.equal(h.inner('aiWork'), true)
+    h.bot.emit('chat', 'Player', 'bot mark 新玩家请求')
+    await flush()
+    assert.equal(h.inner('runtime').generation(), autonomous ? 1 : 0)
+    assert.equal(h.inner('queue').length, autonomous ? 0 : 1)
+    wait.resolve({ reply: '', actions: [{ cmd: 'mark', args: ['原响应'] }], done: true })
+    if (thinking) await thinking
+    await flush()
+    if (!autonomous) {
+      h.intervals.find((timer) => String(timer.fn).includes('queue.shift()')).fn()
+      await flush()
+    }
+    assert.deepEqual(h.marks, autonomous ? [['Player', '新玩家请求']] : [['Player', '原响应'], ['Player', '新玩家请求']])
+  })
+}
 
 test('真实fly入口清除旧跟随目标，停止后持锁降落，旧实例不能借新降落权限', async () => {
   const wait = deferred(), h = harness({ flightWait: wait })

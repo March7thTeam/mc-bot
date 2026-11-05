@@ -2,24 +2,47 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
 
 class CancelledError extends Error {
-  constructor(message = '任务已取消') { super(message); this.name = 'CancelledError' }
+  constructor(message = '任务已取消', code = 'cancelled') { super(message); this.name = 'CancelledError'; this.code = code }
 }
 
-function createRuntime({ timeoutMs = 180_000, onTimeout = () => {} } = {}) {
+// 低优先级任务顶不掉高优先级：调用方拿到这个错误就知道是"忙"，不是"失败"
+class BusyError extends Error {
+  constructor(name, priority) {
+    super(`正在收尾或执行 ${name}，请稍等`)
+    this.name = 'BusyError'
+    this.code = 'BUSY'
+    this.priority = priority
+  }
+}
+
+// 数字越大越优先。日程 10 / 项目 20 / 自保 30 / 玩家 40
+const PRIORITIES = Object.freeze({ idle: 0, routine: 10, project: 20, survival: 30, player: 40 })
+
+function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = () => {} } = {}) {
   const storage = new AsyncLocalStorage()
   let epoch = 0
   let controller = new AbortController()
   let pending = null
   let serial = 0
+  let cancelRevision = 0
+  let lastCancelCode = 'cancelled'
+  // 取消原因按代际记：调用方拿自己开始时的 epoch 来问，才知道是"被抢占"还是"被停止"
+  const cancelCodes = new Map()
   const isActive = () => {
     const s = storage.getStore()
     return !s || (s.epoch === epoch && !s.signal.aborted)
   }
-  const assertActive = () => { if (!isActive()) throw new CancelledError() }
+  const assertActive = () => {
+    if (!isActive()) throw storage.getStore()?.signal.reason || new CancelledError()
+  }
   const unscoped = (fn) => storage.run(undefined, fn)
   const scope = (fn) => storage.run(storage.getStore() || { epoch, signal: controller.signal }, fn)
-  const cancel = (reason = '任务已取消') => {
-    controller.abort(new CancelledError(reason))
+  const cancel = (reason = '任务已取消', code = 'cancelled') => {
+    // halt 只撤销自主动作，不撤销已收到的玩家交接请求。
+    if (code !== 'preempted' && code !== 'halt') { cancelRevision++; lastCancelCode = code }
+    cancelCodes.set(epoch, code)
+    if (cancelCodes.size > 64) cancelCodes.delete(Math.min(...cancelCodes.keys()))
+    controller.abort(new CancelledError(reason, code))
     epoch++
     controller = new AbortController()
   }
@@ -29,26 +52,61 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {} } = {}) {
     return new Promise((resolve, reject) => {
       const done = () => { signal?.removeEventListener('abort', abort); resolve() }
       const timer = setTimeout(done, ms)
-      const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(new CancelledError()) }
+      const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason || new CancelledError()) }
       signal?.addEventListener('abort', abort, { once: true })
       if (signal?.aborted) abort()
     })
   }
-  async function runTask(name, fn, maxMs = timeoutMs) {
+  const assertRequestActive = (revision) => {
+    if (revision !== cancelRevision) throw new CancelledError('任务已取消', lastCancelCode)
+  }
+  // 所有玩家入口先等自主任务收尾；停止/超时是独立屏障，不能被先前的抢占代际掩盖。
+  async function preempt(priority) {
     assertActive()
-    if (pending) throw new Error(`正在收尾或执行 ${pending.name}，请稍等`)
-    const token = { id: ++serial, name, epoch, startedAt: Date.now() }
+    const revision = cancelRevision
+    while (pending) {
+      assertRequestActive(revision)
+      if (priority <= pending.priority || pending.cancelRevision !== cancelRevision) throw new BusyError(pending.name, pending.priority)
+      const victim = pending
+      // 多位玩家等待同一任务时只取消一次，不能让后来的等待者再污染新代际。
+      if (!victim.preempted && victim.epoch === epoch) {
+        victim.preempted = true
+        cancel('被更高优先级任务抢占', 'preempted')
+        unscoped(() => onPreempt(victim))
+      }
+      await victim.settled
+    }
+    assertRequestActive(revision)
+    return revision
+  }
+  async function runTask(name, fn, options = {}) {
+    const { maxMs = timeoutMs, priority = PRIORITIES.routine, origin = null } =
+      typeof options === 'number' ? { maxMs: options } : options
+    assertActive()
+    // 同一任务内部再调 runTask（指令互相复用）不该当成新任务抢自己
+    const store = storage.getStore()
+    if (pending && store?.owner === pending) return await fn()
+    if (pending) {
+      const revision = await preempt(priority)
+      assertRequestActive(revision) // await 返回的微任务间隙也可能收到 stop。
+    }
+    // 多个抢占者同时醒来时仍要互斥；不能覆盖先醒来的玩家任务。
+    if (pending) throw new BusyError(pending.name, pending.priority)
+    const token = { id: ++serial, name, priority, origin, epoch, cancelRevision, startedAt: Date.now(), preempted: false }
+    token.settled = new Promise((resolve) => { token.settle = resolve })
     pending = token
     const timer = setTimeout(() => unscoped(() => {
       if (pending !== token) return
-      cancel('任务超时')
+      cancel('任务超时', 'timeout')
       onTimeout(token)
     }), maxMs)
     try {
-      return await scope(async () => { const result = await fn(); assertActive(); return result })
+      const signal = controller.signal
+      return await storage.run({ epoch: token.epoch, signal, owner: token }, async () => { const result = await fn(); assertActive(); return result })
     } finally {
       clearTimeout(timer)
       if (pending === token) pending = null
+      token.settle()
     }
   }
   function guard(target, names) {
@@ -91,10 +149,12 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {} } = {}) {
       }
     }
   }
-  return { scope, unscoped, assertActive, isActive, cancel, delay, runTask, guardBot,
+  return { scope, unscoped, assertActive, isActive, cancel, delay, runTask, preempt, assertRequestActive, guardBot,
+    ownsTask: () => !!pending && storage.getStore()?.owner === pending,
     busy: () => !!pending, generation: () => epoch,
+    cancelCode: (gen) => cancelCodes.get(gen),
     signal: () => storage.getStore()?.signal || controller.signal,
     status: () => pending ? { ...pending, cancelling: pending.epoch !== epoch } : null }
 }
 
-module.exports = { createRuntime, CancelledError }
+module.exports = { createRuntime, CancelledError, BusyError, PRIORITIES }

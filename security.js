@@ -4,7 +4,7 @@
 const RESERVED_NAMES = new Set([
   ...Object.getOwnPropertyNames(Object.prototype), 'prototype',
 ].map((name) => name.toLowerCase()))
-const NO_ARGS = new Set(['help', 'status', 'come', 'stay', 'stop', 'pos', 'hp', 'look', 'pickup', 'inv', 'sleep', 'eat', 'chest', 'surface', 'places', 'scan', 'advice', 'lastdeath', 'shear', 'milk', 'torch', 'dump', 'blueprints', 'undo', 'workflows'])
+const NO_ARGS = new Set(['help', 'status', 'come', 'stay', 'stop', 'halt', 'pos', 'hp', 'look', 'pickup', 'inv', 'sleep', 'eat', 'chest', 'surface', 'places', 'scan', 'advice', 'lastdeath', 'shear', 'milk', 'torch', 'dump', 'blueprints', 'undo', 'workflows'])
 const AI_ACTIONS = new Set(['inspect', 'try', 'tip', 'get', 'plan', 'farm', 'breed', 'shear', 'milk', 'fish', 'tunnel', 'digdown', 'excavate', 'torch', 'explore', 'dump', 'smelt', 'chest', 'chests', 'chestscan', 'fetch', 'deposit', 'withdraw', 'find', 'hunt', 'surface', 'equip', 'mark', 'go', 'note', 'stay', 'eat', 'come', 'follow', 'stop', 'goto', 'walk', 'mine', 'chop', 'pickup', 'craft', 'sleep', 'guard', 'build', 'paste', 'fill', 'materials', 'blueprints', 'bridge', 'pillar', 'use', 'door', 'repeater', 'rs', 'rstrace', 'rsdiag', 'circuit', 'wire', 'parkour', 'run'])
 const HUNTABLE = new Set(['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'goat', 'cod', 'salmon', 'slime'])
 const MODES = new Set(['self_preservation', 'unstuck', 'item_collecting', 'idle_staring', 'elbow_room', 'sleep_with_players'])

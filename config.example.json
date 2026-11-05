@@ -6,5 +6,6 @@
   "agent": { "port": 25599 },
   "mods": { "enable": [], "disable": [] },
   "workflows": { "auto": true },
+  "autonomy": { "enabled": false, "tickMs": 5000, "maxPerHour": 60 },
   "greet": { "serverName": "我的服务器" }
 }
