@@ -88,14 +88,16 @@ function createGreeter(bot, ctx, env = process.env) {
 
   async function greet(name) {
     const online = Object.keys(bot.players).filter((n) => n !== bot.username).length
-    try {
-      if (!run) throw new Error('没配置 MC_RCON_PASSWORD')
-      await run(greetingCommands(name, bot.username, { online, serverName }))
-      ctx.log(`[greet] ${name}（特效）`)
-    } catch (err) {
-      ctx.log(`[greet] 控制台不可用，改用 /msg: ${err.message.split('\n')[0]}`)
-      ctx.chat(`/msg ${name} ${timeGreeting(new Date().getHours())}，${name}！欢迎回来～我是 ${bot.username}，说 bot help 看我能帮你做什么`)
+    if (run) {
+      try {
+        await run(greetingCommands(name, bot.username, { online, serverName }))
+        ctx.log(`[greet] ${name}（特效）`)
+        return
+      } catch (err) {
+        ctx.log(`[greet] 控制台不可用，改用 /msg: ${err.message.split('\n')[0]}`)
+      }
     }
+    ctx.chat(`/msg ${name} ${timeGreeting(new Date().getHours())}，${name}！欢迎回来～我是 ${bot.username}，说 bot help 看我能帮你做什么`)
   }
 
   // 刚进服时会收到所有已在线玩家的 playerJoined，跳过这批，免得每次重启都把大家问候一遍
