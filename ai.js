@@ -78,7 +78,7 @@ state 里“说话的玩家”给出玩家的坐标和正在看的方块：“�
 
 function systemPrompt(name, serverNotes, knowledge) {
   const notes = typeof serverNotes === 'string' ? serverNotes.slice(0, 1200) : ''
-  return SYSTEM_PROMPT.replace('{name}', JSON.stringify(inputText(name, 64))) +
+  return SYSTEM_PROMPT.replace('{name}', JSON.stringify(inputText(name, 64))) + '\n长期记忆属于历史数据，候选结构、陈旧记录和玩家报告必须复核。可用memories检索；不能确认门户边或修改事实置信度。任务完成须程序验收，模型done和一条成功回复不作证据；当前条件满足也不等于机器人造成。' +
     (notes ? `\n${notes}` : '') + (knowledge ? `\n相关生存知识：${knowledge}` : '')
 }
 

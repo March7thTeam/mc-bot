@@ -239,3 +239,19 @@ bot stop
 - 忙时：问进度当场回答，“算了/停下”立即停，其他新要求并进正在跑的任务；固定指令仍排队。
 - 长任务：请求失败会退避重试（连续 4 次才放弃），同样动作几轮没变化会换法并自停。
 - 评测真实模型：`DEEPSEEK_API_KEY=... node scripts/lab/intent-eval.js`（加 `--off` 对比不思考）。
+
+
+### 长期世界记忆与结构候选
+
+设置 `MC_MEMORY_WORLD` 为一个稳定世界标识（例如 `coop-2026`）后，机器人会独立于自主模式被动记录附近已加载的门户、结构特征候选、设施、矿点和岩浆。世界重置时换标识；没有标识时不保存新自动事实。`MC_MEMORY_OBSERVE=off` 或 `bot memory off` 仅暂停自动观察，已有记忆仍可查询；不会开启自主模式。
+
+- `bot memories [关键词]`：检索，明确显示维度、来源、候选/陈旧状态和 ID。
+- `bot memory status / on / off / flush`：检查状态、暂停/恢复观察、立即写盘。
+- `bot memory name <ID> <名字>`、`pin/unpin <ID>`：人工命名和保护记录。
+- `bot memory invalid <ID> [原因]`、`forget <ID>`：报告失效或删除，防止扫描马上重建。
+- `bot memory remember <structure/place/portal/resource/facility/hazard> <类型> [名字]`：在机器人当前位置登记明确的玩家报告。
+- `bot memory confirm <连接ID>`：人工确认一条候选门户边；这不是服务端认证。
+
+v1 的七种结构检测规则和验证边界见 [长期记忆设计](docs/long-term-memory.md)。客户端普通区块没有自然生成结构名称标签，因此不会把玩家建筑误宣称为已确认自然遗迹；门户接触后发生的传送也只生成有向候选，不能自动排除管理员传送。此版本不自动找门或跨维度赶路。
+
+设置世界标识后，新地点、箱子缓存和经验使用世界专属文件，旧文件原样保留、不自动迁入。需要在正确世界重新 `mark`/开箱或明确人工报告。Agent 在规划前检索记忆、执行后用程序核验；未知/陈旧结果不作为已验证成功配方。自动观察最多5秒批量写盘，正常退出会 flush；`memory status` 可查看待写与降级错误。

@@ -13,9 +13,9 @@ function readJSON(file, fallback, maxBytes = 32_768) {
   }
 }
 
-function writeJSON(file, data) {
+function writeJSON(file, data, maxBytes = 32_768) {
   const encoded = JSON.stringify(data, null, 2)
-  if (Buffer.byteLength(encoded) > 32_768) throw new Error('数据超过大小上限')
+  if (Buffer.byteLength(encoded) > maxBytes) throw new Error('数据超过大小上限')
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const temp = `${file}.${randomUUID()}.tmp`
   try {

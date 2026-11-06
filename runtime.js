@@ -26,6 +26,7 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
   let serial = 0
   let cancelRevision = 0
   let lastCancelCode = 'cancelled'
+  let resourceContext = () => ({})
   // 取消原因按代际记：调用方拿自己开始时的 epoch 来问，才知道是"被抢占"还是"被停止"
   const cancelCodes = new Map()
   const isActive = () => {
@@ -36,7 +37,7 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
     if (!isActive()) throw storage.getStore()?.signal.reason || new CancelledError()
   }
   const unscoped = (fn) => storage.run(undefined, fn)
-  const scope = (fn) => storage.run(storage.getStore() || { epoch, signal: controller.signal }, fn)
+  const scope = (fn) => storage.run(storage.getStore() || { epoch, signal: controller.signal, worldContext: { ...resourceContext() } }, fn)
   const cancel = (reason = '任务已取消', code = 'cancelled') => {
     // halt 只撤销自主动作，不撤销已收到的玩家交接请求。
     if (code !== 'preempted' && code !== 'halt') { cancelRevision++; lastCancelCode = code }
@@ -102,7 +103,7 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
     }), maxMs)
     try {
       const signal = controller.signal
-      return await storage.run({ epoch: token.epoch, signal, owner: token }, async () => { const result = await fn(); assertActive(); return result })
+      return await storage.run({ epoch: token.epoch, signal, owner: token, worldContext: { ...resourceContext() } }, async () => { const result = await fn(); assertActive(); return result })
     } finally {
       clearTimeout(timer)
       if (pending === token) pending = null
@@ -116,12 +117,20 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
       target[name] = function (...args) { assertActive(); return original.apply(this, args) }
     }
   }
-  function guardResource(result) {
+  function guardResource(result, bot, openedContext, getContext) {
+    const originalClose = result?.close
+    if (typeof originalClose === 'function') result.close = function (...args) {
+      const current = getContext?.() || { dimension: bot.game?.dimension }
+      const sameLevel = current.dimension === openedContext.dimension && current.worldKey === openedContext.worldKey
+      const ownsWindow = !('currentWindow' in bot) || bot.currentWindow === result
+      if (sameLevel && ownsWindow) return originalClose.apply(this, args)
+    }
     if (!isActive()) { result?.close?.(); throw new CancelledError() }
     guard(result, ['putFuel', 'putInput', 'takeOutput', 'takeInput', 'takeFuel', 'deposit', 'withdraw'])
     return result
   }
-  function guardBot(bot) {
+  function guardBot(bot, { getContext } = {}) {
+    resourceContext = getContext || (() => ({ dimension: bot.game?.dimension }))
     // Mineflayer 的容器/合成实现会直接调用内部闭包，再写协议包；
     // 只拦 bot.clickWindow 等公开方法无法覆盖这些 await 后的续操作。
     if (typeof bot._client?.write === 'function') {
@@ -130,6 +139,10 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
       bot._client.write = function (name, ...args) {
         // 某些库调用 fire-and-forget activateBlock；这里抛错会成为未处理拒绝。
         // 丢弃旧上下文的包，外层任务通过取消检查/库的有界等待收尾。
+        if (name === 'close_window' && !isActive()) {
+          const origin = storage.getStore()?.worldContext, current = resourceContext()
+          if (origin && (origin.dimension !== current.dimension || origin.worldKey !== current.worldKey)) return
+        }
         if (!cleanup.has(name) && !isActive()) return
         return original.call(this, name, ...args)
       }
@@ -145,7 +158,8 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
       if (!original) continue
       bot[name] = function (...args) {
         assertActive()
-        return Promise.resolve(original.apply(this, args)).then(guardResource)
+        const openedContext = getContext?.() || { dimension: bot.game?.dimension }
+        return Promise.resolve(original.apply(this, args)).then((result) => guardResource(result, bot, openedContext, getContext))
       }
     }
   }

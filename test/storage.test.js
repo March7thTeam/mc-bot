@@ -45,3 +45,18 @@ test('写盘失败不向内存发布新地点；加载拒绝非法形状和坐�
     assert.deepEqual(readJSON(path.join(dir, 'missing.json'), {}), {})
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('显式字节上限支持长期快照，默认32KiB和原子拒绝行为保持', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcbot-store-cap-'))
+  try {
+    const file = path.join(dir, 'large.json'), old = { original: true }
+    writeJSON(file, old); const before = fs.readFileSync(file)
+    const value = { text: '长'.repeat(16_000) }
+    assert.throws(() => writeJSON(file, value), /大小上限/)
+    assert.deepEqual(fs.readFileSync(file), before)
+    writeJSON(file, value, 65_536)
+    assert.deepEqual(readJSON(file, null, 65_536), value)
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+    assert.deepEqual(fs.readdirSync(dir), ['large.json'])
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})

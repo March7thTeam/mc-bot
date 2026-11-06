@@ -31,6 +31,8 @@ const KEYS = {
   'agent.host': ['MC_AGENT_HOST', str(64)],
   'mods.enable': ['MC_MODS', list(/^[a-z0-9][a-z0-9_.-]{0,63}$/, 64)],
   'mods.disable': ['MC_MODS_DISABLE', list(/^[a-z0-9][a-z0-9_.-]{0,63}$/, 64)],
+  'memory.world': ['MC_MEMORY_WORLD', (v) => { if (typeof v !== 'string' || !/^[\p{L}\p{N}_.-]{1,64}$/u.test(v)) throw new Error('必须是1到64位稳定世界标识'); return v }],
+  'memory.observe': ['MC_MEMORY_OBSERVE', bool],
   'workflows.auto': ['MC_WORKFLOWS_AUTO', bool],
   'autonomy.enabled': ['MC_AUTONOMY', bool],
   'autonomy.tickMs': ['MC_AUTONOMY_TICK', int(1000, 60000)],

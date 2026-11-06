@@ -5,7 +5,7 @@ const RESERVED_NAMES = new Set([
   ...Object.getOwnPropertyNames(Object.prototype), 'prototype',
 ].map((name) => name.toLowerCase()))
 const NO_ARGS = new Set(['help', 'status', 'come', 'stay', 'stop', 'halt', 'pos', 'hp', 'look', 'pickup', 'inv', 'sleep', 'eat', 'chest', 'surface', 'places', 'scan', 'advice', 'lastdeath', 'shear', 'milk', 'torch', 'dump', 'blueprints', 'undo', 'workflows'])
-const AI_ACTIONS = new Set(['inspect', 'try', 'tip', 'get', 'plan', 'farm', 'breed', 'shear', 'milk', 'fish', 'tunnel', 'digdown', 'excavate', 'torch', 'explore', 'dump', 'smelt', 'chest', 'chests', 'chestscan', 'fetch', 'deposit', 'withdraw', 'find', 'hunt', 'surface', 'equip', 'mark', 'go', 'note', 'stay', 'eat', 'come', 'follow', 'stop', 'goto', 'walk', 'mine', 'chop', 'pickup', 'craft', 'sleep', 'guard', 'build', 'paste', 'fill', 'materials', 'blueprints', 'bridge', 'pillar', 'use', 'door', 'repeater', 'rs', 'rstrace', 'rsdiag', 'circuit', 'wire', 'parkour', 'run'])
+const AI_ACTIONS = new Set(['memories', 'inspect', 'try', 'tip', 'get', 'plan', 'farm', 'breed', 'shear', 'milk', 'fish', 'tunnel', 'digdown', 'excavate', 'torch', 'explore', 'dump', 'smelt', 'chest', 'chests', 'chestscan', 'fetch', 'deposit', 'withdraw', 'find', 'hunt', 'surface', 'equip', 'mark', 'go', 'note', 'stay', 'eat', 'come', 'follow', 'stop', 'goto', 'walk', 'mine', 'chop', 'pickup', 'craft', 'sleep', 'guard', 'build', 'paste', 'fill', 'materials', 'blueprints', 'bridge', 'pillar', 'use', 'door', 'repeater', 'rs', 'rstrace', 'rsdiag', 'circuit', 'wire', 'parkour', 'run'])
 const HUNTABLE = new Set(['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'goat', 'cod', 'salmon', 'slime'])
 const MODES = new Set(['self_preservation', 'unstuck', 'item_collecting', 'idle_staring', 'elbow_room', 'sleep_with_players'])
 const BREEDABLE = new Set(['cow', 'mooshroom', 'sheep', 'goat', 'pig', 'chicken', 'rabbit'])
@@ -106,7 +106,23 @@ function normalizeAction(cmd, args, { ai = false } = {}) {
   if (ai && cmd === 'drop') fail('AI 不能丢弃物品，请玩家直接使用 bot drop <物品> [数量]')
   if (ai && !AI_ACTIONS.has(cmd)) fail('AI 不允许执行此指令')
   let normalized
-  if (NO_ARGS.has(cmd)) {
+  if (cmd === 'memories') {
+    normalized = textArgs(args, 120, true)
+  } else if (cmd === 'memory') {
+    arity(args, 0, 8)
+    const sub = args[0] || 'status'
+    if (!['status', 'on', 'off', 'flush', 'name', 'pin', 'unpin', 'invalid', 'forget', 'confirm', 'remember'].includes(sub)) fail('未知记忆操作')
+    if (['status', 'on', 'off', 'flush'].includes(sub)) { arity(args, 0, 1); normalized = [sub] }
+    else if (sub === 'remember') {
+      arity(args, 3, 8)
+      if (!['structure', 'place', 'portal', 'resource', 'facility', 'hazard'].includes(args[1])) fail('未知记忆类型')
+      normalized = [sub, args[1], safeName(args[2], 'item'), ...(args.length > 3 ? textArgs(args.slice(3), 80) : [])]
+    } else {
+      arity(args, sub === 'name' ? 3 : 2, ['name', 'invalid'].includes(sub) ? 8 : 2)
+      if (!/^[a-zA-Z0-9_-]{1,80}$/.test(args[1])) fail('记忆ID不合法')
+      normalized = [sub, args[1], ...(args.length > 2 ? textArgs(args.slice(2), 80) : [])]
+    }
+  } else if (NO_ARGS.has(cmd)) {
     arity(args, 0)
     normalized = []
   } else if (['mine', 'craft', 'smelt', 'deposit', 'withdraw', 'fetch', 'drop', 'get', 'plan'].includes(cmd)) {

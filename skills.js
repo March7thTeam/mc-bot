@@ -24,7 +24,8 @@ function loadPlaces(file = PLACES_FILE) {
     if (!validName(name) || !p || typeof p !== 'object') continue
     if (![p.x, p.y, p.z].every(Number.isFinite) || Math.abs(p.x) > 29_999_984 || Math.abs(p.z) > 29_999_984 || p.y < -64 || p.y > 319) continue
     if (p.dim !== undefined && (typeof p.dim !== 'string' || p.dim.length > 100)) continue
-    out[name] = { x: p.x, y: p.y, z: p.z, ...(p.dim ? { dim: p.dim } : {}) }
+    if (p.worldKey !== undefined && (typeof p.worldKey !== 'string' || !/^[a-f0-9]{64}$/.test(p.worldKey))) continue
+    out[name] = { x: p.x, y: p.y, z: p.z, ...(p.dim ? { dim: p.dim } : {}), ...(p.worldKey ? { worldKey: p.worldKey } : {}) }
   }
   return out
 }
@@ -107,15 +108,29 @@ function createSkills(bot, ctx) {
     return openRemembered(block)
   }
   // 开箱、关箱时各记一次内容；记忆出错不能影响取放
-  const dimension = () => bot.game?.dimension || 'unknown'
+  const dimension = () => ctx.memoryContext?.()?.worldKey ? ctx.memoryContext().dimension : bot.game?.dimension || 'unknown'
   function rememberChest(block, chest) {
     try { ctx.containers?.update(block.position, dimension(), chest.containerItems(), { double: chest.inventoryStart >= 54 }) } catch (err) { ctx.log(`[containers] ${err.message}`) }
   }
   async function openRemembered(block) {
+    const openedDimension = dimension(), openedContext = ctx.memoryContext?.(), openedGeneration = ctx.generation?.()
     const chest = await bot.openContainer(block)
-    rememberChest(block, chest)
+    const rememberOpened = () => {
+      try { ctx.containers?.update(block.position, openedDimension, chest.containerItems(), { double: chest.inventoryStart >= 54 }) } catch (err) { ctx.log(`[containers] ${err.message}`) }
+    }
+    ctx.assertActive?.()
+    const stillHere = () => { const current = ctx.memoryContext?.(); return openedContext ? current?.epoch === openedContext.epoch && current?.dimension === openedContext.dimension : dimension() === openedDimension }
+    if (!stillHere()) throw new Error('维度变化，旧容器操作已取消')
+    rememberOpened()
     const close = chest.close.bind(chest)
-    chest.close = () => { rememberChest(block, chest); close() }
+    chest.close = () => {
+      // Never let a late old-window callback read/write/close the new window.
+      const current = ctx.memoryContext?.()
+      const sameLevel = openedContext ? current?.worldKey === openedContext.worldKey && current?.dimension === openedContext.dimension : dimension() === openedDimension
+      if (!sameLevel || ('currentWindow' in bot && bot.currentWindow !== chest)) return
+      if (stillHere() && (openedGeneration === undefined || ctx.generation?.() === openedGeneration)) rememberOpened()
+      close()
+    }
     return chest
   }
 
@@ -290,7 +305,7 @@ function createSkills(bot, ctx) {
     if (!validName(name)) return say('地点名需为 1~32 个中文、字母、数字、下划线或短横线')
     if (!Object.hasOwn(places, name) && Object.keys(places).length >= MAX_PLACES) return say('地点已达 64 个，用 bot unmark <地点名> 删除后再记')
     const p = bot.entity.position
-    const value = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), dim: bot.game.dimension }
+    const value = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), dim: dimension(), ...(ctx.memoryContext?.()?.worldKey ? { worldKey: ctx.memoryContext().worldKey } : {}) }
     const next = { ...places, [name]: value }
     persistPlaces(next)
     places[name] = value
@@ -308,8 +323,8 @@ function createSkills(bot, ctx) {
 
   async function gotoPlace(name, routeOptions = {}) {
     const p = Object.hasOwn(places, name) && places[name]
-    if (!p) return say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`)
-    if (p.dim && p.dim !== bot.game.dimension) return say(`${name} 不在这个维度`)
+    if (!p) { say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`); return { ok: false, error: 'unknown_place' } }
+    if ((p.worldKey && p.worldKey !== ctx.memoryContext?.()?.worldKey) || (p.dim && p.dim !== dimension())) { say(`${name} 不在这个维度`); return { ok: false, error: 'different_dimension' } }
     say(`去 ${name} (${p.x} ${p.y} ${p.z})`)
     if (ctx.travelTo) {
       const result = await ctx.travelTo({ x: p.x, y: p.y, z: p.z }, { range: 1, ...routeOptions })
