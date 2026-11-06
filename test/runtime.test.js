@@ -117,3 +117,22 @@ test('真实openBlock形态的fire-and-forget激活在停止后不发包也不�
   await runtime.runTask('normal', async () => client.write('block_place'))
   assert.deepEqual(sent, ['block_place'])
 })
+
+test('late old-level open cannot close a new same-number window before caller wrapping', async () => {
+  const runtime = createRuntime(), waiting = deferred(); let closed = 0
+  let context = { worldKey: 'world', dimension: 'example:first' }
+  const oldWindow = { id: 1, close() { closed++ } }, newWindow = { id: 1 }
+  const bot = { currentWindow: oldWindow, openContainer: () => waiting.promise }
+  runtime.guardBot(bot, { getContext: () => context })
+  const opening = runtime.scope(() => bot.openContainer())
+  context = { ...context, dimension: 'example:second' }; bot.currentWindow = newWindow; runtime.cancel('changed', 'dimension_changed')
+  waiting.resolve(oldWindow); await assert.rejects(opening, CancelledError); assert.equal(closed, 0); assert.equal(bot.currentWindow, newWindow)
+})
+
+test('stop then level change still blocks a stale direct close_window from the original scope', async () => {
+  const runtime = createRuntime(), wait = deferred(), sent = []; let context = { worldKey: 'world', dimension: 'one' }
+  const bot = { _client: { write: (name) => sent.push(name) } }; runtime.guardBot(bot, { getContext: () => context })
+  const old = runtime.scope(async () => { await wait.promise; bot._client.write('close_window', { windowId: 1 }) })
+  runtime.cancel('stop', 'stop'); context = { ...context, dimension: 'two' }; runtime.cancel('level', 'dimension_changed'); wait.resolve(); await old
+  assert.deepEqual(sent, [])
+})

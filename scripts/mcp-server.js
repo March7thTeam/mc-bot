@@ -14,6 +14,9 @@ const str = (description, extra = {}) => ({ type: 'string', description, ...extr
 const TOOLS = [
   { name: 'minecraft_state', description: '机器人当前状态：坐标、血量、饥饿、维度、背包、正在做的任务、附近玩家', inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     call: () => api('GET', '/state') },
+  { name: 'minecraft_memories', description: '检索当前世界长期记忆：门户、结构候选、设施与行动经历。历史线索需要现场复核；本工具不修改或确认事实',
+    inputSchema: { type: 'object', properties: { query: str('可选关键词', { maxLength: 120 }) }, additionalProperties: false },
+    call: (a) => api('POST', '/command', { cmd: 'memories', args: a.query ? [a.query] : [], wait: true }) },
   { name: 'minecraft_commands', description: '列出可用指令（含模组扩展注册的）和用法', inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     call: () => api('GET', '/commands') },
   { name: 'minecraft_command', description: '让机器人执行一条固定指令，和玩家说 "bot <cmd> <args>" 一样，同样的参数校验。默认等它做完再返回结果（最长 10 分钟）',

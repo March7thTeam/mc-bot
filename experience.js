@@ -31,12 +31,14 @@ function similarity(a, b) {
   return hit / Math.sqrt(x.size * y.size)
 }
 function cleanEntry(e) {
-  if (!e || typeof e !== 'object' || typeof e.goal !== 'string' || !e.goal.trim() || !['done', 'failed'].includes(e.outcome)) return null
+  if (!e || typeof e !== 'object' || typeof e.goal !== 'string' || !e.goal.trim() || !['done', 'failed', 'unverified'].includes(e.outcome)) return null
   const list = (v, n, max) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).slice(0, n).map((x) => short(x, max)) : [])
-  return { goal: short(e.goal, 80), outcome: e.outcome, rounds: Number.isSafeInteger(e.rounds) && e.rounds > 0 ? e.rounds : 1, steps: list(e.steps, 10, 24), why: list(e.why, 3, 40), at: Number.isFinite(e.at) ? e.at : 0 }
+  return { goal: short(e.goal, 80), outcome: e.outcome, rounds: Number.isSafeInteger(e.rounds) && e.rounds > 0 ? e.rounds : 1, steps: list(e.steps, 10, 24), why: list(e.why, 3, 40), ...(e.conditionVerified === true ? { conditionVerified: true } : {}), at: Number.isFinite(e.at) ? e.at : 0 }
 }
 function format(e) {
   const steps = e.steps.length ? `：${e.steps.join(' → ')}` : ''
+  if (e.outcome === 'done' && e.conditionVerified) return `「${e.goal}」当前条件已核对（不证明由Bot造成）${steps}`
+  if (e.outcome === 'unverified') return `「${e.goal}」处理结束但未完整核验${steps}`
   return e.outcome === 'done' ? `「${e.goal}」做成了（${e.rounds} 轮）${steps}` : `「${e.goal}」没做成${e.why.length ? `，卡在 ${e.why.join('、')}` : ''}${steps}`
 }
 
