@@ -633,6 +633,8 @@ async function mineIds(ids, count, maxDistance = 32) {
     .some(([x, y, z]) => bot.blockAt(p.offset(x, y, z))?.type === lava)
   // 水下挖慢 5 倍、浮着再慢 5 倍，木镐一块石头接近 30 秒，撞上单块超时（出生点水坑实测）：挨着水的放到最后再挖
   const wet = (p) => [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1]].some(([x, y, z]) => isWaterCell(bot.blockAt(p.offset(x, y, z))))
+  const floating = () => bot.entity.isInWater && !bot.entity.onGround &&
+    bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))?.boundingBox !== 'block'
   let swam = false
   const bad = new Set() // 日志：同一个够不着的方块会被反复选中直到 3 次失败，失败过的就跳过换下一个
   // 连锁采集类模组一次掉一堆（实测：chop 4 报 4，背包里 18 个原木）：能按物品名对上的以背包增量为准
@@ -644,6 +646,13 @@ async function mineIds(ids, count, maxDistance = 32) {
     const candidates = bot.findBlocks({ matching: ids, maxDistance, count: 24 }).filter((p) => !nearLava(p) && !bad.has(p.toString()))
     const pos = candidates.find((p) => !wet(p)) ?? candidates[0]
     if (!pos) break
+    // Leave deep water before collecting. The plugin can resolve a no-path attempt without digging.
+    if (floating()) {
+      if (swam) return { got: gained(), error: '还漂在深水里，没找到能上岸挖掘的位置' }
+      swam = true
+      await leaveWater(pos)
+      continue
+    }
     // 没有能采集的工具时 mineflayer-tool 会无限递归去箱子里找，必须提前拦下
     const target = bot.blockAt(pos)
     if (!target.canHarvest(null) && !bot.inventory.items().some((i) => target.canHarvest(i.type))) {
@@ -651,6 +660,9 @@ async function mineIds(ids, count, maxDistance = 32) {
     }
     try {
       await collectWithin(target)
+      runtime.assertActive()
+      const after = bot.blockAt(pos)
+      if (!after || after.type === target.type) throw Object.assign(new Error(`未挖到 ${target.name}`), { name: 'NoPath' })
       got++
     } catch (err) {
       console.log(`[mine] ${err.name}: ${err.message}`)
@@ -665,9 +677,6 @@ async function mineIds(ids, count, maxDistance = 32) {
       if (combat.active()) await combat.waitOver()
       else {
         misses++; bad.add(pos.toString())
-        // 漂在深水里不许挖放（会越挖越深），够不着岸边的方块就一直放弃（版本矩阵 1.19.4 实测：4 块各等 32 秒）。先游上岸再挑
-        const feet = bot.entity.position.floored()
-        if (!swam && bot.entity.isInWater && bot.blockAt(feet.offset(0, -1, 0))?.boundingBox !== 'block') { swam = true; await leaveWater(pos) }
       }
     }
   }

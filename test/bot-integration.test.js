@@ -243,6 +243,29 @@ test('寻路被自保抢占时先等脱险，再重试同一个目标', { timeou
   assert.deepEqual(calls, [goal, goal])
 })
 
+test('深水漂浮先上岸再挖，浅水脚踩地时不游岸，空的采集回执不计成功', async t => {
+  for (const deep of [true, false]) await t.test(deep ? 'deep' : 'shallow', async () => {
+    const p = new Vec3(2, 64, 0), inv = new EventEmitter(), calls = []
+    const target = { position: p, type: 1, name: 'dirt', canHarvest: () => true }
+    let dug = false
+    inv.items = () => []
+    const h = harness({ configureBot(bot) {
+      bot.entity = { position: new Vec3(0.5, 64, 0.5), isInWater: true, onGround: !deep }
+      bot.inventory = inv
+      bot.registry.blocks = { 1: { name: 'dirt' } }
+      bot.registry.blocksByName.lava = { id: 2 }
+      bot.findBlocks = () => [p]
+      bot.blockAt = (at) => at.equals(p) && !dug ? target : { type: 0, name: 'air', boundingBox: 'empty' }
+      bot.collectBlock.collect = async () => { calls.push('collect'); dug = deep }
+    } })
+    h.bot.swim = async () => { calls.push('shore'); h.bot.entity.isInWater = false; h.bot.entity.onGround = true }
+    const result = await h.inner("leaveWater = bot.swim; runTask('test mine', async () => { const result = await mineIds([1], 1); return { ok: result.got === 1, ...result } })")
+    assert.equal(result.got, Number(deep))
+    assert.equal(result.ok, deep)
+    assert.deepEqual(calls, deep ? ['shore', 'collect'] : ['collect'])
+  })
+})
+
 test('同类型的不同 level 同步取消旧任务，普通 game 和重复 respawn 不会取消', async (t) => {
   const taskWait = deferred()
   const h = harness({ taskWait, configureBot(bot) {
