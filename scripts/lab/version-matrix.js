@@ -257,9 +257,9 @@ async function runVersion(version, options, control) {
     // 场地不成立就抛到启动失败分支，不再启动机器人或执行后续项目。
     await prepareArena(tester, c, rcon, waitFor)
     await rcon('setworldspawn 0 100 0')
-    const env = { ...process.env, MC_HOST: '127.0.0.1', MC_PORT: String(options.port), MC_NAME: NAME, MC_VERSION: '', AI_PROVIDER: 'off',
+    const env = { PATH: process.env.PATH, MC_HOST: '127.0.0.1', MC_PORT: String(options.port), MC_NAME: NAME, MC_VERSION: '', AI_PROVIDER: 'off',
       MC_RCON_HOST: '127.0.0.1', MC_RCON_PORT: String(options.port + 1), MC_RCON_PASSWORD: password,
-      MC_CTL: '', MC_AGENT_PORT: '', MC_AUTONOMY: 'off', MC_MODS: '', MC_MODS_DISABLE: '' }
+      MC_CTL: '', MC_AGENT_PORT: '', MC_AUTONOMY: 'off', MC_WORKFLOWS_AUTO: 'off', MC_MODS: '', MC_MODS_DISABLE: '' }
     child = spawn(process.execPath, ['--max-old-space-size=256', 'bot.js'], { cwd: sandbox, env, stdio: ['ignore', 'pipe', 'pipe'] })
     child.stdout.on('data', (chunk) => { log += chunk.toString() })
     child.stderr.on('data', (chunk) => { log += chunk.toString() })
