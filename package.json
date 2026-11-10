@@ -11,7 +11,8 @@
     "check": "node scripts/check.js",
     "probe:registry": "node scripts/probe-registry.js",
     "test": "node --test test/*.test.js",
-    "mcp": "node scripts/mcp-server.js"
+    "mcp": "node scripts/mcp-server.js",
+    "lab:versions": "node scripts/lab/version-matrix.js"
   },
   "keywords": [],
   "author": "",

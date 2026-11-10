@@ -3,6 +3,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const vm = require('node:vm')
 const { EventEmitter } = require('node:events')
+const { createRequire } = require('node:module')
 const { Vec3 } = require('vec3')
 
 function harness({ reachable = true, cover = true } = {}) {
@@ -20,7 +21,8 @@ function harness({ reachable = true, cover = true } = {}) {
       * getPathFromTo(moves) { assert.equal(moves, safe); yield { result: { status: reachable ? 'success' : 'noPath', path: [{}] } } } },
     pvp: { stop() {} }, hawkEye: { stop() {} }, activateItem: (offhand) => used.push(offhand), deactivateItem: () => used.push(false),
   })
-  vm.runInNewContext(fs.readFileSync(require.resolve('../combat'), 'utf8'), { module, require, setInterval: fn => { tick = fn } })
+  const file = require.resolve('../combat')
+  vm.runInNewContext(fs.readFileSync(file, 'utf8'), { module, require: createRequire(file), setInterval: fn => { tick = fn } })
   const combat = module.exports.createCombat(bot, { log: text => logs.push(text), retreatMoves: () => safe,
     onCombatStart() {}, onCombatOver() {}, autoEat: () => eaten++ })
   return { bot, combat, tick: () => tick(), goals, used, logs, safe, work, eaten: () => eaten }

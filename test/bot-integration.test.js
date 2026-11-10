@@ -55,7 +55,7 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
       if (realSkills && file.endsWith('/places.json')) return { 家: { x: 80, y: 64, z: 0, dim: 'overworld' } }
       return fallback
     }, writeJSON() {} }, // 别写入真实 data
-    './ai': { createAI: () => ({ ask: (...args) => { calls.push(['ask', args[0]]); return ask(...args) }, cancel() {}, statistics: () => ({}) }) },
+    './ai': { createAI: (options) => ({ ask: (...args) => { calls.push(['ask', args[0]]); return ask(...args) }, cancel() {}, statistics: () => ({}), serverNotes: options.getServerNotes }) },
     './skills': { createSkills: (_bot, ctx) => ({
       commands: {
         mark: (u, args) => marks.push([u, ...args]),
@@ -168,6 +168,27 @@ test('go 在真实技能、execStep 和 API 回执中拒绝未知或跨维度地
   h.bot.game.dimension = 'overworld'
   assert.equal((await h.apiHandlers.command({ cmd: 'go', args: ['家'], wait: true })).ok, true)
   assert.equal(h.calls.filter(c => c[0] === 'travelTo').length, 1)
+})
+
+test('出生和换维度刷新版本事实、旧名与坐标边界', (t) => {
+  const { setWorldBounds, normalizeAction } = require('../security')
+  t.after(() => { setWorldBounds(-64, 319); require('../knowledge').useVersion(null) })
+  const log = { id: 17, name: 'log' }
+  const h = harness({ configureBot(bot) {
+    bot.version = '1.8.8'
+    bot.supportFeature = require('minecraft-data')('1.8.8').supportFeature
+    bot.registry.itemsByName.log = bot.registry.blocksByName.log = log
+    bot.game.minY = 0; bot.game.height = 256
+  } })
+  assert.equal(h.bot.registry.itemsByName.oak_log, log)
+  assert.equal(h.bot.registry.blocksByName.oak_log, log)
+  assert.ok(h.logs.some(line => line.includes('[version] 1.8.8：世界 0~255')))
+  assert.match(h.inner('ai').serverNotes(), /没有副手.*没有攻击冷却/)
+  assert.throws(() => normalizeAction('goto', ['0', '-1', '0']))
+  h.bot.game = { dimension: 'custom:low', minY: -128, height: 512 }
+  h.bot.emit('game')
+  assert.equal(normalizeAction('goto', ['0', '-128', '0']).args[1], '-128')
+  assert.match(h.inner('ai').serverNotes(), /世界高度 -128~383/)
 })
 
 test('真实 craft 从橡木原木补齐临时工作台用掉的木板，按完整数量匹配配方', async () => {

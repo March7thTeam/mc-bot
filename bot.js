@@ -31,12 +31,13 @@ const { createExplorer } = require('./explore')
 const { createBuilder } = require('./build')
 const { createRedstone } = require('./redstone')
 const { createParkour } = require('./parkour')
-const { relevantTips, modTipFor, useMods } = require('./knowledge')
+const { relevantTips, modTipFor, useMods, useVersion } = require('./knowledge')
+const { versionFacts, describeVersion, installLegacyAliases, flightVerified } = require('./versions')
 const { createMods } = require('./mods')
 const { loadWorkflows, createRunner } = require('./workflows')
 const { createAgentApi, createEventLog } = require('./agent-api')
 const { Vec3 } = require('vec3')
-const { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter } = require('./security')
+const { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter, setWorldBounds } = require('./security')
 const path = require('path')
 const { readJSON, writeJSON } = require('./storage')
 console.log(`[startup] mc-bot ${require('./package.json').version}`)
@@ -53,9 +54,9 @@ let flight = null
 let autoTravel = null
 let parkour = null
 
-// 留空 = 连上前先 ping 服务器拿版本。完整验证过的只有 26.1，其他版本能进服，但部分修正（鞘翅、附魔、挖掘时间）不生效
+// 留空时 ping 服务器拿版本。内容和机制查注册表，自动飞行另查实测白名单。
 const VERSION = process.env.MC_VERSION || false
-const TESTED_VERSIONS = new Set(['26.1', '26.1.1', '26.1.2'])
+let facts = null, legacyAliases = 0
 const mods = createMods({ enable: process.env.MC_MODS, disable: process.env.MC_MODS_DISABLE })
 useMods(mods)
 const agentEvents = createEventLog() // 给 Agent API / MCP 的事件流
@@ -84,9 +85,20 @@ bot._client?.prependListener('respawn', readLevelName)
 
 // Fabric 服在配置阶段同步注册表：按里面出现的命名空间启用模组扩展，并给模组物品组件登记编码
 setupFabric(bot, { version: VERSION || undefined, onRegistries: (namespaces) => { mods.activate(namespaces); return mods.componentCodecs() } })
+function updateVersion() {
+  facts = versionFacts(bot)
+  legacyAliases += installLegacyAliases(bot.registry, facts)
+  useVersion(facts)
+  setWorldBounds(facts.minY, facts.maxY)
+}
+bot.on('game', updateVersion)
+bot.on('spawn', () => {
+  updateVersion()
+  console.log(`[version] ${facts.version}：世界 ${facts.minY}~${facts.maxY}，鞘翅自动飞行 ${flightVerified(facts.version) ? '开' : '关'}${legacyAliases ? `，旧名别名 ${legacyAliases} 个` : ''}`)
+})
 bot.once('login', () => {
+  updateVersion()
   mods.activate(null) // 非 Fabric 服没有注册表：只启用 always 和 MC_MODS 点名的
-  console.log(`[startup] 游戏版本 ${bot.version}${TESTED_VERSIONS.has(bot.version) ? '' : '（未完整验证：鞘翅自动飞行关闭，其他功能可能有偏差）'}`)
   mods.setupAll({ bot, registerCommand: registerExtensionCommand, ctx: { say, sleepMs } })
   loadAllWorkflows() // 扩展指令注册完再读，工作流里可以用它们
   startAgentApi()
@@ -1499,7 +1511,7 @@ function makeAI() {
       jsonMode: process.env.AI_JSON_MODE !== 'off', fallbacks: process.env.AI_FALLBACKS !== 'off',
       thinking: (process.env.AI_THINKING || process.env.DEEPSEEK_THINKING) !== 'off',
       limits: { perMinute: process.env.AI_RPM, perHour: process.env.AI_RPH },
-      getName: () => bot.username, getServerNotes: () => [mods.promptNotes(), workflowPromptNotes()].filter(Boolean).join('\n'),
+      getName: () => bot.username, getServerNotes: () => [describeVersion(facts), mods.promptNotes(), workflowPromptNotes()].filter(Boolean).join('\n'),
     })
     console.log(`[ai] 后端 ${AI_PROVIDER}${process.env.AI_MODEL ? ` / ${process.env.AI_MODEL}` : ''}`)
     return made

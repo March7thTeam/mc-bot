@@ -233,7 +233,7 @@ test('26.1 actual item components accept only nonexplosive Flight 1 and read com
 })
 
 test('known 26.1 default component patches accept ordinary rockets; unknown versions never assume defaults', async () => {
-  for (const version of ['26.1', '26.1.2']) {
+  for (const version of ['26.1', '26.1.1', '26.1.2']) {
     const ordinary = rocket(32, null)
     assert.deepEqual(ordinary.components, [])
     assert.deepEqual(ordinary.removedComponents, [])
@@ -244,7 +244,7 @@ test('known 26.1 default component patches accept ordinary rockets; unknown vers
     assert.equal(guidance.rocketCount(h.bot), 32)
     assert.equal((await h.flight.fly(goal)).ok, true)
   }
-  for (const version of [undefined, null, '', '26.1.1', '26.1.3', '1.21.11', 'unknown', 775]) {
+  for (const version of [undefined, null, '', '26.1.3', '1.21.11', 'unknown', 775]) {
     assert.equal(guidance.validRocket(rocket(32, null), version), false)
     assert.equal(guidance.validRocket(rocket(), version), false)
   }
@@ -270,6 +270,53 @@ test('removed, duplicate, mismatched and malformed fireworks patches cannot fall
   const legacy = rocket(32, null); legacy.nbt = { value: { Fireworks: {} } }; malformed.push(legacy)
   const malformedRaw = rocket(32, null); malformedRaw.components.push({ type: 'fireworks', data: null }); malformed.push(malformedRaw)
   for (const item of malformed) assert.equal(guidance.validRocket(item, '26.1'), false)
+})
+
+// 只在这个隔离模块里放开版本门，验证将来人工加白名单后的格式分支；生产白名单不变。
+function probeGuidance() {
+  const fs = require('node:fs'), vm = require('node:vm'), filename = require.resolve('../flight-guidance')
+  const module = { exports: {} }
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module, Map, require: (name) => name === './versions'
+    ? { ...require('../versions'), flightVerified: () => true } : require(name) }, { filename })
+  return module.exports
+}
+function nbtRocket(version, flight = 1, explosions) {
+  return { name: version === '1.12.2' || version === '1.8.8' ? 'fireworks' : 'firework_rocket', count: 2,
+    nbt: { type: 'compound', ...(version === '1.12.2' ? { name: '' } : {}), value: { Fireworks: { type: 'compound', value: {
+      Flight: { type: 'byte', value: flight }, ...(explosions === undefined ? {} : { Explosions: explosions }),
+    } } } } }
+}
+
+for (const version of ['1.8.8', '1.12.2', '1.20.4']) {
+  test(`${version} 实测形状的 NBT 只认时长 1 和无爆炸，生产版本门保持关闭`, () => {
+    const probe = probeGuidance(), ordinary = nbtRocket(version), empty = { type: 'list', value: { type: 'compound', value: [] } }
+    assert.equal(probe.validRocket(ordinary, version), true)
+    assert.equal(probe.validRocket(nbtRocket(version, 1, empty), version), true)
+    assert.equal(probe.validRocket(nbtRocket(version, 1, { type: 'list', value: { type: 'end', value: [] } }), version), true)
+    assert.equal(guidance.validRocket(ordinary, version), false)
+    assert.equal(guidance.rocketCount({ version, inventory: { items: () => [ordinary] } }), 0)
+    for (const flight of [0, 2, 3, '1', null, NaN]) assert.equal(probe.validRocket(nbtRocket(version, flight), version), false)
+    for (const explosions of [null, {}, [], { type: 'list', value: [] }, { type: 'list', value: { type: 'compound', value: [{}] } },
+      { type: 'list', value: { type: 'compound', value: [{ Type: { type: 'byte', value: 0 } }] } }]) {
+      assert.equal(probe.validRocket(nbtRocket(version, 1, explosions), version), false)
+    }
+    for (const nbt of [null, 1, [], {}, { value: null }, { type: 'compound', value: { Fireworks: null } },
+      { type: 'compound', value: { Fireworks: { type: 'compound', value: { Flight: { type: 'string', value: 1 } } } } }]) {
+      assert.equal(probe.validRocket({ ...ordinary, nbt }, version), false)
+    }
+    assert.equal(probe.validRocket({ ...ordinary, name: ordinary.name === 'fireworks' ? 'firework_rocket' : 'fireworks' }, version), false)
+    for (const count of [0, -1, 65, 1.5, '2', NaN]) assert.equal(probe.validRocket({ ...ordinary, count }, version), false)
+  })
+}
+
+test('1.21.4 实测组件空补丁和显式时长分开处理，白名单仍拒绝', () => {
+  const probe = probeGuidance()
+  assert.equal(probe.validRocket(rocket(2, null), '1.21.4'), true)
+  assert.equal(probe.validRocket(rocket(2), '1.21.4'), true)
+  assert.equal(probe.validRocket(rocket(2, { flightDuration: 3, explosions: [] }), '1.21.4'), false)
+  assert.equal(probe.validRocket(rocket(2, { flightDuration: 1, explosions: [{}] }), '1.21.4'), false)
+  assert.equal(guidance.validRocket(rocket(2, null), '1.21.4'), false)
+  assert.equal(guidance.validRocket(nbtRocket('1.20.4'), '26.1'), false)
 })
 
 test('native flight performs confirmed takeoff, awaits equip, uses hand rocket and resolves only after stable landing', async () => {

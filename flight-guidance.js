@@ -1,6 +1,7 @@
 'use strict'
 
 const { Vec3 } = require('vec3')
+const { flightVerified, compareRelease } = require('./versions')
 
 // The phase/pitch guidance and angle normalization are adapted from EAFE.
 // See THIRD_PARTY_NOTICES.md for the pinned sources and adaptation boundaries.
@@ -202,14 +203,18 @@ function launchYaw(bot, point, yaw, config) {
   return null
 }
 
-// The 26.1 Slot packet carries a component *patch*, not a fully expanded item.
-// Prismarine-item fromNotch only puts that patch into componentMap. Vanilla
-// Flight 1/no-explosion rockets therefore legitimately have an empty patch.
-// These versions alone have been checked against the native item defaults.
-const KNOWN_DEFAULT_ROCKET_VERSIONS = new Set(['26.1', '26.1.2'])
+// 组件是相对原版默认值的补丁，空补丁代表时长 1；旧 NBT 为空却是时长 0。
 function validRocket(item, version) {
-  if (!KNOWN_DEFAULT_ROCKET_VERSIONS.has(version) || item?.name !== 'firework_rocket' ||
-      !Number.isInteger(item.count) || item.count < 1 || item.count > 64) return false
+  if (!flightVerified(version) || !item || !Number.isInteger(item.count) || item.count < 1 || item.count > 64) return false
+  if (compareRelease(version, '1.20.5') < 0) {
+    if (item.name !== (compareRelease(version, '1.13') < 0 ? 'fireworks' : 'firework_rocket')) return false
+    const nbt = item.nbt, fireworks = nbt?.value?.Fireworks, flight = fireworks?.value?.Flight
+    if (nbt?.type !== 'compound' || fireworks?.type !== 'compound' || flight?.type !== 'byte' || flight.value !== 1) return false
+    const explosions = fireworks.value.Explosions
+    return explosions === undefined || (explosions?.type === 'list' && ['compound', 'end'].includes(explosions.value?.type) &&
+      Array.isArray(explosions.value.value) && explosions.value.value.length === 0)
+  }
+  if (item.name !== 'firework_rocket') return false
   if (!(item.componentMap instanceof Map) || !Array.isArray(item.components) || !Array.isArray(item.removedComponents)) return false
   for (const removed of item.removedComponents) {
     if (!removed || typeof removed.type !== 'string' || removed.type === 'fireworks' || removed.type === 'minecraft:fireworks') return false
