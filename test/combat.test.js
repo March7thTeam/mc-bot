@@ -8,7 +8,7 @@ const { Vec3 } = require('vec3')
 
 function harness({ reachable = true, cover = true } = {}) {
   const bot = new EventEmitter(), module = { exports: {} }, goals = [], used = [], logs = []
-  let tick, eaten = 0
+  let tick, eaten = 0, paused = false, eating = false
   const safe = {}, work = {}, origin = new Vec3(0.5, 64, 0.5)
   const archer = { id: 1, name: 'skeleton', position: new Vec3(-4, 64, 0) }
   const pillager = { id: 2, name: 'pillager', position: new Vec3(-4, 64, 2) }
@@ -24,8 +24,10 @@ function harness({ reachable = true, cover = true } = {}) {
   const file = require.resolve('../combat')
   vm.runInNewContext(fs.readFileSync(file, 'utf8'), { module, require: createRequire(file), setInterval: fn => { tick = fn } })
   const combat = module.exports.createCombat(bot, { log: text => logs.push(text), retreatMoves: () => safe,
+    paused: () => paused, isEating: () => eating,
     onCombatStart() {}, onCombatOver() {}, autoEat: () => eaten++ })
-  return { bot, combat, tick: () => tick(), goals, used, logs, safe, work, eaten: () => eaten }
+  return { bot, combat, tick: () => tick(), goals, used, logs, safe, work, eaten: () => eaten,
+    pause: () => { paused = true }, eat: () => { eating = true } }
 }
 
 test('远程多敌撤退时选择安全可达掩体、稳定保持目标，到掩体后清理并进食', () => {
@@ -55,4 +57,14 @@ test('掩体不可达时退离远程怪，盾仅在面向远程怪时举起', ()
   assert.deepEqual(h.used, [true, false])
   h.combat.stop()
   assert.equal(h.bot.pathfinder.goal, null)
+})
+
+test('安全模式接管时收起战斗盾牌，进食已接管时不发送释放操作', () => {
+  for (const eating of [false, true]) {
+    const h = harness({ reachable: false })
+    h.tick(); h.bot.emit('physicsTick')
+    if (eating) h.eat()
+    h.pause(); h.bot.emit('physicsTick'); h.bot.emit('physicsTick')
+    assert.deepEqual(h.used, eating ? [true] : [true, false])
+  }
 })

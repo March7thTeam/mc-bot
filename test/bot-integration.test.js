@@ -243,6 +243,26 @@ test('寻路被自保抢占时先等脱险，再重试同一个目标', { timeou
   assert.deepEqual(calls, [goal, goal])
 })
 
+test('长时间未脱离危险结束赶路回执，保留自保控制', { timeout: 2500 }, async t => {
+  const h = harness(), ready = deferred()
+  h.bot.entity.position = new Vec3(0, 64, 0)
+  let now = Date.now(), attempts = 0
+  t.mock.method(Date, 'now', () => now)
+  h.bot.pathfinder.goto = async () => {
+    attempts++
+    h.bot.safetyRecovering = true
+    ready.resolve()
+    throw Object.assign(new Error('safety takeover'), { name: 'GoalChanged' })
+  }
+  const pending = h.inner("runTask('test travel', () => travel({ x: 0, y: 64, z: 5 }))")
+  await ready.promise
+  await flush()
+  now += 15_001
+  assert.equal((await pending).error, '未脱离危险，自保仍在尝试')
+  assert.equal(attempts, 1)
+  assert.equal(h.bot.safetyRecovering, true)
+})
+
 test('深水漂浮先上岸再挖，浅水脚踩地时不游岸，空的采集回执不计成功', async t => {
   for (const deep of [true, false]) await t.test(deep ? 'deep' : 'shallow', async () => {
     const p = new Vec3(2, 64, 0), inv = new EventEmitter(), calls = []

@@ -87,6 +87,11 @@ function createCombat(bot, ctx) {
     equippingShield = true
     try { await bot.equip(shield, 'off-hand') } catch {} finally { equippingShield = false }
   }
+  function releaseShield() {
+    if (!blocking) return
+    blocking = false
+    if (!ctx.isEating?.() && offHand()?.name === 'shield' && bot.usingHeldItem !== false) bot.deactivateItem()
+  }
 
   function stopShooting() {
     if (shooting) bot.hawkEye.stop()
@@ -290,7 +295,7 @@ function createCombat(bot, ctx) {
 
   // 举盾：追骷髅的路上举着，贴脸了放下来砍
   bot.on('physicsTick', () => {
-    if (ctx.paused?.() || !hasOffhand()) return
+    if (ctx.paused?.() || !hasOffhand()) return releaseShield()
     const t = bot.pvp.target
     // 盾只能挡前方。背向弓手时收盾，以全速拉开距离。
     const archerAhead = mode === 'retreat' && retreatArchers.some((mob) => {
@@ -301,7 +306,7 @@ function createCombat(bot, ctx) {
     // 吃东西时不举盾：举盾/放下会打断进食（日志：撤退中连续"吃东西超时"后被射死）
     const want = !ctx.isEating?.() && offHand()?.name === 'shield' && ((!!t && SKELETONS.has(mobName(t)) && dist(t) > 3.5) || archerAhead)
     if (want && !blocking) { bot.activateItem(true); blocking = true }
-    if (!want && blocking) { bot.deactivateItem(); blocking = false }
+    if (!want) releaseShield()
   })
 
   function end() {
@@ -317,7 +322,7 @@ function createCombat(bot, ctx) {
     }
     retreatMovement = null
     retreatArchers = []
-    if (blocking) { bot.deactivateItem(); blocking = false }
+    releaseShield()
     ctx.onCombatOver()
   }
 

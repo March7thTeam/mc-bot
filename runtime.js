@@ -118,6 +118,19 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
       target[name] = function (...args) { assertActive(); return original.apply(this, args) }
     }
   }
+  function scopePathfinder(inject) {
+    return function (bot, options) {
+      const on = bot.on
+      // The plugin plans from an unscoped physics tick and may equip before it digs or places.
+      bot.on = function (event, listener) {
+        if (event !== 'physicsTick') return on.call(this, event, listener)
+        return on.call(this, event, function (...args) {
+          return storage.run({ epoch, worldEpoch, signal: controller.signal, pathfinderTick: true }, () => listener.apply(this, args))
+        })
+      }
+      try { return inject(bot, options) } finally { bot.on = on }
+    }
+  }
   function guardResource(bot, result, openedWorld) {
     // A late open can resolve with the next level's window. Do not touch it.
     if (openedWorld !== worldEpoch) throw new CancelledError('维度变化，旧容器操作已取消', 'dimension_changed')
@@ -144,15 +157,26 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
         return original.call(this, name, ...args)
       }
     }
-    guard(bot, ['equip', 'craft', 'toss', 'tossStack', 'consume', 'sleep', 'placeBlock', 'dig',
+    guard(bot, ['craft', 'toss', 'tossStack', 'consume', 'sleep',
       'attack', 'activateItem', 'elytraFly', 'clickWindow', 'transfer', 'moveSlotItem'])
+    for (const name of ['equip', 'placeBlock', 'dig', 'activateBlock']) {
+      const original = bot[name]
+      if (typeof original !== 'function') continue
+      bot[name] = function (...args) {
+        // Let the plugin clear its in-flight bookkeeping without touching the world.
+        if (storage.getStore()?.pathfinderTick && !isActive()) return Promise.resolve()
+        // Other library call sites can fire-and-forget activateBlock; the packet guard handles them.
+        if (name !== 'activateBlock') assertActive()
+        return original.apply(this, args)
+      }
+    }
     // Local movement flags can outlive the old promise and drive the new world's physics.
-    for (const name of ['setControlState', 'clearControlStates', 'look', 'lookAt']) {
+    for (const name of ['setControlState', 'clearControlStates', 'look', 'lookAt', 'stopDigging']) {
       const original = bot[name]
       if (typeof original !== 'function') continue
       bot[name] = function (...args) {
         const scope = storage.getStore()
-        if (!scope || scope.worldEpoch === worldEpoch) return original.apply(this, args)
+        if (!scope || (scope.worldEpoch === worldEpoch && (!scope.pathfinderTick || isActive()))) return original.apply(this, args)
         if (name === 'look' || name === 'lookAt') return Promise.resolve()
       }
     }
@@ -177,7 +201,7 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
       }
     }
   }
-  return { scope, unscoped, assertActive, isActive, cancel, delay, runTask, preempt, assertRequestActive, guardBot,
+  return { scope, unscoped, assertActive, isActive, cancel, delay, runTask, preempt, assertRequestActive, guardBot, scopePathfinder,
     ownsTask: () => !!pending && storage.getStore()?.owner === pending,
     busy: () => !!pending, generation: () => epoch,
     cancelCode: (gen) => cancelCodes.get(gen),

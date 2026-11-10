@@ -113,7 +113,7 @@ for (const method of ['on', 'addListener']) {
   bot[method] = (event, fn) => event === 'physicTick' ? original('physicsTick', fn)
     : ((event === 'diggingAborted' || event === 'diggingCompleted') && bot.listeners(event).includes(fn) ? bot : original(event, fn))
 }
-bot.loadPlugin(pathfinder)
+bot.loadPlugin(runtime.scopePathfinder(pathfinder))
 bot.loadPlugin(collectBlock)
 bot.loadPlugin(toolPlugin)
 bot.loadPlugin(pvp)
@@ -506,7 +506,11 @@ async function travel(goal) {
       }
       const interrupted = ['GoalChanged', 'PathStopped'].includes(err.name)
       if (!interrupted || attempt >= 5 || run !== actionRun || !task) throw err
-      while (modes.recovering?.()) await sleepMs(150)
+      const escapeDeadline = Date.now() + 15_000
+      while (modes.recovering?.()) {
+        if (Date.now() >= escapeDeadline) throw Object.assign(new Error('未脱离危险，自保仍在尝试'), { code: 'hazard_escape_timeout' })
+        await sleepMs(150)
+      }
       if (combat.active()) await combat.waitOver()
       await sleepMs(300)
     }
@@ -1424,7 +1428,7 @@ async function flyLegs(target, freeY, options = {}) {
 function reportTravel(result) {
   runtime.assertActive()
   if (result.ok) say(`到了 ${fmt(result.position)}，${result.transport === 'walk' ? '步行' : '使用鞘翅' + (result.transport === 'hybrid' ? '并步行对接' : '')}，消耗${result.rocketsUsed || 0}枚烟花`)
-  else say(`未到目标，停在 ${result.position ? fmt(result.position) : '未知位置'}：${result.reason}`)
+  else say(`未到目标，停在 ${result.position ? fmt(result.position) : '未知位置'}：${TRAVEL_REASON[result.reason] || result.reason}`)
 }
 const TRAVEL_REASON = {
   torso_occupied: '穿着普通胸甲，保留现有装备', torso_changed: '装备被改变',
@@ -1433,6 +1437,7 @@ const TRAVEL_REASON = {
   not_on_ground: '尚未回到地面', not_stationary: '尚未停稳', health_low: '血量偏低', food_low: '食物不足',
   overworld_survival_required: '当前维度或游戏模式不适合飞行', unsafe_body_block: '当前位置有危险',
   water_fire_or_lava: '当前在水、火或岩浆中', eating: '正在进食', combat: '正在战斗', container_open: '容器尚未关闭',
+  hazard_escape_timeout: '未脱离危险，自保仍在尝试',
 }
 autoTravel = createAutoTravel(bot, {
   assertActive: runtime.assertActive, delay: runtime.delay,
