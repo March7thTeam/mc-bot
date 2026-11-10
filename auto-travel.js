@@ -54,6 +54,14 @@ function createAutoTravel(bot, ctx) {
     const e = bot.entity, engine = ctx.getFlight()
     return !!e?.position && !e.elytraFlying && !!(e.onGround || e.isInWater) && !!engine && !engine.active()
   }
+  async function waitForWalkLanding() {
+    const deadline = Date.now() + 2000
+    for (let tick = 0; tick < 40 && !groundedWithIdleFlight(); tick++) {
+      const wait = Math.min(50, deadline - Date.now())
+      if (wait <= 0) break
+      await activeAwait(ctx.delay(wait))
+    }
+  }
   function safeFallback(reason, landed) {
     ctx.assertActive()
     const e = bot.entity, engine = ctx.getFlight()
@@ -201,6 +209,7 @@ function createAutoTravel(bot, ctx) {
     const walkedAfterLanding = result?.finalApproach === 'walk' || result?.transport === 'hybrid'
     // A native final walking receipt follows its confirmed landing. Normal
     // walking momentum need not satisfy the stationary takeoff/landing gate.
+    if (result?.landed === true && walkedAfterLanding && !STOP.test(reason)) await waitForWalkLanding()
     current.walkAfterLanding = result?.landed === true && walkedAfterLanding && groundedWithIdleFlight()
     current.flightConfirmed = result?.landed === true && groundedWithIdleFlight() &&
       (current.walkAfterLanding || stationary()) &&
@@ -211,7 +220,11 @@ function createAutoTravel(bot, ctx) {
       current.fallbackReason = reason
       current.walkAfterLanding = true // The stable landing gate passed above.
       if (!current.flew) current.selectionReason = 'preflight_walk'
-      try { await activeAwait(walk(target, range)); return outcome('approach_incomplete', reason) }
+      try {
+        await activeAwait(walk(target, range))
+        await waitForWalkLanding()
+        return outcome('approach_incomplete', reason)
+      }
       catch (error) { ctx.assertActive(); return outcome(failureCode(error), reason) }
     }
     // A thrown flight must be inactive and stably grounded before any fallback;

@@ -1486,7 +1486,6 @@ function biomeName() {
 const recentChat = []
 const recentActions = []
 const remember = (list, line, max) => { list.push(String(line).slice(0, 200)); if (list.length > max) list.shift() }
-bot.on('chat', (user, message) => { if (typeof message === 'string') remember(recentChat, `${user === bot.username ? '我' : user}: ${message.slice(0, 80)}`, 8) })
 function describeState(user = currentRequester, query = '') {
   const lessons = query ? experience.recall(goal?.text || query).join('；').slice(0, 500) : ''
   const stored = bot.entity ? ctx.containers.describe(bot.game?.dimension || 'unknown', bot.entity.position, `${goal?.text || ''} ${query}`).slice(0, 500) : ''
@@ -1998,6 +1997,9 @@ const PREFIXES = ['bot', ...String(process.env.MC_PREFIX || '').split(',').map((
   return false
 }).slice(0, 4)]
 const PREFIX_RE = new RegExp(`^(?:${PREFIXES.join('|')})\\s+`, 'iu') // 唤醒词只含字母数字汉字下划线，不用转义
+function systemFeedback(user, message) {
+  return /^(?:rcon|server|@)$/i.test(String(user).trim()) || /^\[[^\[\]\r\n:：]+[:：][\s\S]*\]$/.test(message.trim())
+}
 function handleChat(user, message, { whisper = false } = {}) {
   Promise.resolve().then(async () => {
     if (user === bot.username || typeof message !== 'string') return
@@ -2016,7 +2018,7 @@ function handleChat(user, message, { whisper = false } = {}) {
     }
     if (!safeMoves || !bot.entity) return say('还没准备好，请等进服后再试')
     console.log(`[command] user=${String(user).slice(0, 32)} cmd=${name.slice(0, 32)}`)
-    const reading = readCommands.has(name) || !!extensionCommands.get(name)?.read || (['mode', 'note', 'goal'].includes(name) && !args.length)
+    const reading = readCommands.has(name) || !!extensionCommands.get(name)?.read || (['mode', 'note', 'goal', 'lessons'].includes(name) && !args.length)
     // 先统一等待自主任务收尾，覆盖自然语言、跟随和工作流等不直接调用 runTask 的入口。
     const preemptable = runtime.status()?.origin === 'auto' && !goal
     if (!stopping && !reading && preemptable) {
@@ -2052,7 +2054,7 @@ function handleChat(user, message, { whisper = false } = {}) {
       const said = []
       sayLog = said
       return Promise.resolve(runtime.scope(() => fn(user, checked.args))).finally(() => { if (sayLog === said) sayLog = null }).then((outcome) => {
-        if (outcome?.stopped || !(outcome?.kind === 'travel' ? !outcome.ok : outcome?.ok === false || said.some((l) => FAILURE.test(l)))) return
+        if (outcome?.stopped || outcome?.replan === false || !(outcome?.kind === 'travel' ? !outcome.ok : outcome?.ok === false || said.some((l) => FAILURE.test(l)))) return
         return replanAfterFailure(user, `${name} ${checked.args.join(' ')}`.trim(), said)
       })
     }
@@ -2064,11 +2066,16 @@ function handleChat(user, message, { whisper = false } = {}) {
     runtime.unscoped(() => say('指令未执行：' + err.message))
   })
 }
-bot.on('chat', handleChat)
-bot.on('chat', (user, message) => { if (user !== bot.username && typeof message === 'string') agentEvents.push('chat', { user: String(user).slice(0, 32), text: message.slice(0, 300) }) })
+bot.on('chat', (user, message) => {
+  if (typeof message !== 'string' || systemFeedback(user, message)) return
+  remember(recentChat, `${user === bot.username ? '我' : user}: ${message.slice(0, 80)}`, 8)
+  if (user === bot.username) return
+  agentEvents.push('chat', { user: String(user).slice(0, 32), text: message.slice(0, 300) })
+  handleChat(user, message)
+})
 // 私聊不用加 bot 前缀
 bot.on('whisper', (user, message) => {
-  if (user === bot.username || typeof message !== 'string') return
+  if (user === bot.username || typeof message !== 'string' || systemFeedback(user, message)) return
   handleChat(user, PREFIX_RE.test(message.trim()) ? message : `bot ${message}`, { whisper: true })
 })
 

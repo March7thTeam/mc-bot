@@ -308,8 +308,14 @@ function createSkills(bot, ctx) {
 
   async function gotoPlace(name, routeOptions = {}) {
     const p = Object.hasOwn(places, name) && places[name]
-    if (!p) return say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`)
-    if (p.dim && p.dim !== bot.game.dimension) return say(`${name} 不在这个维度`)
+    if (!p) {
+      say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`)
+      return { ok: false, error: '没有这个地点', replan: false }
+    }
+    if (p.dim && p.dim !== bot.game.dimension) {
+      say(`${name} 不在这个维度`)
+      return { ok: false, error: '地点不在当前维度', replan: false }
+    }
     say(`去 ${name} (${p.x} ${p.y} ${p.z})`)
     if (ctx.travelTo) {
       const result = await ctx.travelTo({ x: p.x, y: p.y, z: p.z }, { range: 1, ...routeOptions })
