@@ -31,12 +31,13 @@ const { createExplorer } = require('./explore')
 const { createBuilder } = require('./build')
 const { createRedstone } = require('./redstone')
 const { createParkour } = require('./parkour')
-const { relevantTips, modTipFor, useMods } = require('./knowledge')
+const { relevantTips, modTipFor, useMods, useVersion } = require('./knowledge')
+const { versionFacts, describeVersion, installLegacyAliases, flightVerified } = require('./versions')
 const { createMods } = require('./mods')
 const { loadWorkflows, createRunner } = require('./workflows')
 const { createAgentApi, createEventLog } = require('./agent-api')
 const { Vec3 } = require('vec3')
-const { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter } = require('./security')
+const { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter, setWorldBounds } = require('./security')
 const path = require('path')
 const { readJSON, writeJSON } = require('./storage')
 console.log(`[startup] mc-bot ${require('./package.json').version}`)
@@ -53,9 +54,9 @@ let flight = null
 let autoTravel = null
 let parkour = null
 
-// 留空 = 连上前先 ping 服务器拿版本。完整验证过的只有 26.1，其他版本能进服，但部分修正（鞘翅、附魔、挖掘时间）不生效
+// 留空时 ping 服务器拿版本。内容和机制查注册表，自动飞行另查实测白名单。
 const VERSION = process.env.MC_VERSION || false
-const TESTED_VERSIONS = new Set(['26.1', '26.1.1', '26.1.2'])
+let facts = null, legacyAliases = 0
 const mods = createMods({ enable: process.env.MC_MODS, disable: process.env.MC_MODS_DISABLE })
 useMods(mods)
 const agentEvents = createEventLog() // 给 Agent API / MCP 的事件流
@@ -72,11 +73,32 @@ const bot = mineflayer.createBot({
   hideErrors: true, // 下面的 error 监听已记一行；默认还会再打整段堆栈，服务器关着时每次重启刷十几行
 })
 
+let levelName = null
+const dimension = () => levelName ?? bot.game?.dimension
+// Mineflayer 的 game 事件可能只带维度类型。同类型的自定义世界仍有独立的 level name。
+function readLevelName(packet) {
+  const name = packet.worldState?.name ?? packet.worldName
+  levelName = typeof name === 'string' && name ? name.replace(/^minecraft:/, '') : null
+}
+bot._client?.prependListener('login', readLevelName)
+bot._client?.prependListener('respawn', readLevelName)
+
 // Fabric 服在配置阶段同步注册表：按里面出现的命名空间启用模组扩展，并给模组物品组件登记编码
 setupFabric(bot, { version: VERSION || undefined, onRegistries: (namespaces) => { mods.activate(namespaces); return mods.componentCodecs() } })
+function updateVersion() {
+  facts = versionFacts(bot)
+  legacyAliases += installLegacyAliases(bot.registry, facts)
+  useVersion(facts)
+  setWorldBounds(facts.minY, facts.maxY)
+}
+bot.on('game', updateVersion)
+bot.on('spawn', () => {
+  updateVersion()
+  console.log(`[version] ${facts.version}：世界 ${facts.minY}~${facts.maxY}，鞘翅自动飞行 ${flightVerified(facts.version) ? '开' : '关'}${legacyAliases ? `，旧名别名 ${legacyAliases} 个` : ''}`)
+})
 bot.once('login', () => {
+  updateVersion()
   mods.activate(null) // 非 Fabric 服没有注册表：只启用 always 和 MC_MODS 点名的
-  console.log(`[startup] 游戏版本 ${bot.version}${TESTED_VERSIONS.has(bot.version) ? '' : '（未完整验证：鞘翅自动飞行关闭，其他功能可能有偏差）'}`)
   mods.setupAll({ bot, registerCommand: registerExtensionCommand, ctx: { say, sleepMs } })
   loadAllWorkflows() // 扩展指令注册完再读，工作流里可以用它们
   startAgentApi()
@@ -91,7 +113,7 @@ for (const method of ['on', 'addListener']) {
   bot[method] = (event, fn) => event === 'physicTick' ? original('physicsTick', fn)
     : ((event === 'diggingAborted' || event === 'diggingCompleted') && bot.listeners(event).includes(fn) ? bot : original(event, fn))
 }
-bot.loadPlugin(pathfinder)
+bot.loadPlugin(runtime.scopePathfinder(pathfinder))
 bot.loadPlugin(collectBlock)
 bot.loadPlugin(toolPlugin)
 bot.loadPlugin(pvp)
@@ -410,7 +432,7 @@ async function gotoWatched(goal) {
   const watch = setInterval(() => {
     const p = bot.entity.position
     if (p.distanceTo(spot) > 1) { spot = p.clone(); spotAt = Date.now() }
-    if (combat.active() || eating || bot.targetDigBlock || dist() < best - 3) { best = Math.min(best, dist()); bestAt = Date.now(); spotAt = Date.now() }
+    if (combat.active() || modes.recovering?.() || eating || bot.targetDigBlock || dist() < best - 3) { best = Math.min(best, dist()); bestAt = Date.now(); spotAt = Date.now() }
     // 寻路算不出更近的点时路径是空的：人不动、不报错，goto 也不会返回。空等 20 秒就够了
     const idle = !bot.pathfinder.isMoving() && Date.now() - spotAt > IDLE_MS
     if (idle || Date.now() - bestAt > NO_PROGRESS_MS) {
@@ -484,6 +506,11 @@ async function travel(goal) {
       }
       const interrupted = ['GoalChanged', 'PathStopped'].includes(err.name)
       if (!interrupted || attempt >= 5 || run !== actionRun || !task) throw err
+      const escapeDeadline = Date.now() + 15_000
+      while (modes.recovering?.()) {
+        if (Date.now() >= escapeDeadline) throw Object.assign(new Error('未脱离危险，自保仍在尝试'), { code: 'hazard_escape_timeout' })
+        await sleepMs(150)
+      }
       if (combat.active()) await combat.waitOver()
       await sleepMs(300)
     }
@@ -610,6 +637,8 @@ async function mineIds(ids, count, maxDistance = 32) {
     .some(([x, y, z]) => bot.blockAt(p.offset(x, y, z))?.type === lava)
   // 水下挖慢 5 倍、浮着再慢 5 倍，木镐一块石头接近 30 秒，撞上单块超时（出生点水坑实测）：挨着水的放到最后再挖
   const wet = (p) => [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1]].some(([x, y, z]) => isWaterCell(bot.blockAt(p.offset(x, y, z))))
+  const floating = () => bot.entity.isInWater && !bot.entity.onGround &&
+    bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))?.boundingBox !== 'block'
   let swam = false
   const bad = new Set() // 日志：同一个够不着的方块会被反复选中直到 3 次失败，失败过的就跳过换下一个
   // 连锁采集类模组一次掉一堆（实测：chop 4 报 4，背包里 18 个原木）：能按物品名对上的以背包增量为准
@@ -621,6 +650,13 @@ async function mineIds(ids, count, maxDistance = 32) {
     const candidates = bot.findBlocks({ matching: ids, maxDistance, count: 24 }).filter((p) => !nearLava(p) && !bad.has(p.toString()))
     const pos = candidates.find((p) => !wet(p)) ?? candidates[0]
     if (!pos) break
+    // Leave deep water before collecting. The plugin can resolve a no-path attempt without digging.
+    if (floating()) {
+      if (swam) return { got: gained(), error: '还漂在深水里，没找到能上岸挖掘的位置' }
+      swam = true
+      await leaveWater(pos)
+      continue
+    }
     // 没有能采集的工具时 mineflayer-tool 会无限递归去箱子里找，必须提前拦下
     const target = bot.blockAt(pos)
     if (!target.canHarvest(null) && !bot.inventory.items().some((i) => target.canHarvest(i.type))) {
@@ -628,6 +664,9 @@ async function mineIds(ids, count, maxDistance = 32) {
     }
     try {
       await collectWithin(target)
+      runtime.assertActive()
+      const after = bot.blockAt(pos)
+      if (!after || after.type === target.type) throw Object.assign(new Error(`未挖到 ${target.name}`), { name: 'NoPath' })
       got++
     } catch (err) {
       console.log(`[mine] ${err.name}: ${err.message}`)
@@ -642,9 +681,6 @@ async function mineIds(ids, count, maxDistance = 32) {
       if (combat.active()) await combat.waitOver()
       else {
         misses++; bad.add(pos.toString())
-        // 漂在深水里不许挖放（会越挖越深），够不着岸边的方块就一直放弃（版本矩阵 1.19.4 实测：4 块各等 32 秒）。先游上岸再挑
-        const feet = bot.entity.position.floored()
-        if (!swam && bot.entity.isInWater && bot.blockAt(feet.offset(0, -1, 0))?.boundingBox !== 'block') { swam = true; await leaveWater(pos) }
       }
     }
   }
@@ -757,7 +793,7 @@ async function craftItem(name, count, depth) {
   const shortfall = (r) => {
     const times = Math.ceil(count / r.result.count)
     return r.delta.filter((d) => d.count < 0)
-      .map((d) => ({ id: d.id, need: -d.count * times - bot.inventory.count(d.id, null) }))
+      .map((d) => ({ id: d.id, need: -d.count * times - bot.inventory.count(d.id, d.metadata) }))
       .filter((d) => d.need > 0)
   }
   const ranked = all.map((r) => ({ r, miss: shortfall(r) }))
@@ -766,14 +802,16 @@ async function craftItem(name, count, depth) {
   // 报第一个（缺得最少、最可能成功的）配方的失败原因：后面的备选配方只会报"缺黑石"之类，掩盖真正原因
   let firstErr = null
   const fail = (msg) => { firstErr ||= msg }
-  for (const { r, miss } of ranked) {
-    if (miss.length && depth >= 3) continue
-    let ok = true
-    for (const d of miss) {
+  async function prepareIngredients(missing) {
+    if (missing.length && depth >= 3) return false
+    for (const d of missing) {
       const sub = bot.registry.items[d.id].name
-      if (await craftItem(sub, d.need, depth + 1)) { ok = false; fail(`缺 ${sub}`); break }
+      if (await craftItem(sub, d.need, depth + 1)) { fail(`缺 ${sub}`); return false }
     }
-    if (!ok) continue
+    return true
+  }
+  for (const { r, miss } of ranked) {
+    if (!await prepareIngredients(miss)) continue
     if (r.requiresTable && !table) {
       table = await getTable(depth)
       if (!table) { fail(bot.inventory.count(bot.registry.itemsByName.crafting_table.id) ? '身边没地方放工作台（换个开阔的地方）' : '没有工作台，也做不出来'); continue }
@@ -786,17 +824,20 @@ async function craftItem(name, count, depth) {
         table = await getTable(depth, false) // 走不过去就在身边放一个新的
         if (!table) { fail('工作台走不过去，也放不了新的'); continue }
       }
+      // 临时做的工作台可能吃掉本配方已经准备好的木板。
+      if (!await prepareIngredients(shortfall(r))) continue
     }
     // 用 mineflayer 重新取一次配方，确保材料就绪
     await inventorySettled()
     // 共享背包下背包内 2x2 合成不稳定（日志：多次 "updateSlot:0 did not fire"），手边有工作台就一律用工作台
     const reach = (t) => t && t.position.distanceTo(bot.entity.position) < 4
     let station = r.requiresTable ? table : (reach(findTable()) ? findTable() : null)
-    let ready = bot.recipesFor(item.id, null, 1, station)[0]
+    let ready = bot.recipesFor(item.id, null, count, station)[0]
     if (!ready) continue
     try {
       await bot.craft(ready, Math.ceil(count / ready.result.count), station)
     } catch (err) {
+      runtime.assertActive()
       if (!/did not fire|updateSlot|missing ingredient/.test(err.message)) throw err
       console.log(`[craft] ${name} 背包没同步（${station ? '工作台' : '背包合成'}），清理后用工作台重试`)
       runtime.unscoped(() => bot.closeWindow(bot.inventory)) // 关一次背包界面，服务器会把合成格里残留的材料退回背包
@@ -805,7 +846,7 @@ async function craftItem(name, count, depth) {
       if (station) await travel(new goals.GoalNear(station.position.x, station.position.y, station.position.z, 2)).catch(() => {})
     // 先确认能靠近工作台，避免不可达时仍等待 windowOpen 超时。
       if (station && bot.entity.position.distanceTo(station.position.offset(0.5, 0.5, 0.5)) > 4.5) return `够不着工作台（${fmt(station.position)}），走不过去`
-      ready = bot.recipesFor(item.id, null, 1, station)[0]
+      ready = bot.recipesFor(item.id, null, count, station)[0]
       if (!ready) return '背包同步后材料不够了'
       await bot.craft(ready, Math.ceil(count / ready.result.count), station)
     }
@@ -931,7 +972,9 @@ let followTarget = null // 正在跟随的玩家，打完架恢复跟随
 let followDistance = 2
 let post = null // bot stay 设下的站岗位置，打完架走回去
 const combat = createCombat(bot, {
-  paused: () => !!flight?.active() || !!parkour?.inJump(),
+  paused: () => !!flight?.active() || !!parkour?.inJump() || !!modes.recovering?.(),
+  retreatMoves: () => safeMoves,
+  movementOwner: () => `${runtime.generation()}:${runtime.status()?.id ?? 0}`,
   autoEat: (force) => autoEat(force),
   isEating: () => eating,
   log: (...a) => console.log(...a),
@@ -1059,6 +1102,7 @@ const commands = {
 // ---- 进阶指令和常驻模式（skills.js / modes.js）----
 const ctx = {
   travelTimeout, behindIsSafe, isDropAt,
+  dimension,
   travelTo: (...args) => autoTravel.travelTo(...args),
   say, runTask, travel, sleepMs, fmt, craftItem, placeNearby, equipWeapon, resume: resumeIdle,
   alias: (n) => Object.hasOwn(ALIASES, n) ? ALIASES[n] : n,
@@ -1127,7 +1171,40 @@ function makeFlight() {
   return engine
 }
 flight = makeFlight()
-bot.on('spawn', () => { flight.dispose('respawn'); flight = makeFlight() })
+let lastDimension
+function handleDimension() {
+  const next = dimension()
+  if (!next || next === lastDimension) return
+  const previous = lastDimension
+  lastDimension = next
+  if (!previous || !safeMoves) return
+  console.log(`[world] ${previous} → ${next}，取消旧维度任务`)
+  runtime.cancel('维度变化，旧任务已取消', 'dimension_changed')
+  actionRun++
+  ai?.cancel()
+  if (goal || restoringGoal) saveGoal(null)
+  goal = restoringGoal = null
+  followTarget = post = task = null
+  queue.length = 0
+  companion.resetFollow()
+  flight.dispose('dimension_changed')
+  flight = makeFlight()
+  stopTaskControls('dimension_changed')
+  runtime.unscoped(() => {
+    const oldWindow = bot.currentWindow
+    if (oldWindow) {
+      // A protocol close from the old level could use the new level's window id.
+      bot.currentWindow = null
+      oldWindow.emit?.('close')
+      bot.emit('windowClose', oldWindow)
+    }
+    combat.stop()
+    bot.pathfinder.setMovements(safeMoves)
+  })
+}
+bot.on('game', handleDimension)
+bot.on('respawn', handleDimension)
+bot.on('spawn', () => { handleDimension(); flight.dispose('respawn'); flight = makeFlight() })
 commands.fly = (_user, args) => {
   if (eating || combat.active() || bot.currentWindow) return say('先等吃饭、战斗或容器操作结束再起飞')
   let target
@@ -1135,7 +1212,7 @@ commands.fly = (_user, args) => {
     const name = args[0]
     const place = skills.places && Object.hasOwn(skills.places, name) && skills.places[name]
     if (!place) return say('没有这个地点，先 bot mark 记录；步行仍可用 bot goto')
-    if (place.dim && place.dim !== bot.game.dimension) return say('地点不在当前维度')
+    if (place.dim && place.dim !== dimension()) return say('地点不在当前维度')
     target = { x: place.x, y: place.y, z: place.z }
   } else if (args.length === 2) {
     const [x, z] = args.map(Number) // 不给高度：落在那里的地面上
@@ -1351,7 +1428,7 @@ async function flyLegs(target, freeY, options = {}) {
 function reportTravel(result) {
   runtime.assertActive()
   if (result.ok) say(`到了 ${fmt(result.position)}，${result.transport === 'walk' ? '步行' : '使用鞘翅' + (result.transport === 'hybrid' ? '并步行对接' : '')}，消耗${result.rocketsUsed || 0}枚烟花`)
-  else say(`未到目标，停在 ${result.position ? fmt(result.position) : '未知位置'}：${result.reason}`)
+  else say(`未到目标，停在 ${result.position ? fmt(result.position) : '未知位置'}：${TRAVEL_REASON[result.reason] || result.reason}`)
 }
 const TRAVEL_REASON = {
   torso_occupied: '穿着普通胸甲，保留现有装备', torso_changed: '装备被改变',
@@ -1360,9 +1437,11 @@ const TRAVEL_REASON = {
   not_on_ground: '尚未回到地面', not_stationary: '尚未停稳', health_low: '血量偏低', food_low: '食物不足',
   overworld_survival_required: '当前维度或游戏模式不适合飞行', unsafe_body_block: '当前位置有危险',
   water_fire_or_lava: '当前在水、火或岩浆中', eating: '正在进食', combat: '正在战斗', container_open: '容器尚未关闭',
+  hazard_escape_timeout: '未脱离危险，自保仍在尝试',
 }
 autoTravel = createAutoTravel(bot, {
   assertActive: runtime.assertActive, delay: runtime.delay,
+  dimension,
   getFlight: () => flight,
   ready: () => ({ ok: !eating && !combat.active() && !bot.currentWindow && !bot.isSleeping,
     reason: eating ? 'eating' : combat.active() ? 'combat' : bot.currentWindow ? 'container_open' : bot.isSleeping ? 'sleeping' : null }),
@@ -1391,7 +1470,7 @@ commands.walk = (_user, args) => {
   if (args.length === 1) {
     const place = Object.hasOwn(skills.places, args[0]) && skills.places[args[0]]
     if (!place) { say('没有这个地点'); return { ok: false, error: '没有这个地点' } }
-    if (place.dim && place.dim !== bot.game.dimension) { say('地点不在当前维度'); return { ok: false, error: '地点不在当前维度' } }
+    if (place.dim && place.dim !== dimension()) { say('地点不在当前维度'); return { ok: false, error: '地点不在当前维度' } }
     target = { x: place.x, y: place.y, z: place.z }
   } else {
     const [x, y, z] = args.map(Number)
@@ -1404,9 +1483,9 @@ commands.walk = (_user, args) => {
   }, { timeoutMs: travelTimeout(target.x, target.z) })
 }
 const companion = createCompanion(bot, {
-  say, log: (...args) => console.log(...args),
+  say, dimension, log: (...args) => console.log(...args),
   getFollow: () => followTarget && ({ name: followTarget, distance: followDistance }),
-  paused: () => runtime.busy() || combat.active() || eating || !!flight?.active(),
+  paused: () => runtime.busy() || combat.active() || eating || !!flight?.active() || !!modes.recovering?.(),
   followEntity: (entity, distance) => { bot.pathfinder.setMovements(safeMoves); bot.pathfinder.setGoal(new goals.GoalFollow(entity, distance), true) },
   pauseFollow: () => bot.pathfinder.setGoal(null),
   clearFollow: (reason) => { followTarget = null; bot.pathfinder.setGoal(null); say(reason) },
@@ -1446,7 +1525,7 @@ function makeAI() {
       jsonMode: process.env.AI_JSON_MODE !== 'off', fallbacks: process.env.AI_FALLBACKS !== 'off',
       thinking: (process.env.AI_THINKING || process.env.DEEPSEEK_THINKING) !== 'off',
       limits: { perMinute: process.env.AI_RPM, perHour: process.env.AI_RPH },
-      getName: () => bot.username, getServerNotes: () => [mods.promptNotes(), workflowPromptNotes()].filter(Boolean).join('\n'),
+      getName: () => bot.username, getServerNotes: () => [describeVersion(facts), mods.promptNotes(), workflowPromptNotes()].filter(Boolean).join('\n'),
     })
     console.log(`[ai] 后端 ${AI_PROVIDER}${process.env.AI_MODEL ? ` / ${process.env.AI_MODEL}` : ''}`)
     return made
@@ -1486,10 +1565,9 @@ function biomeName() {
 const recentChat = []
 const recentActions = []
 const remember = (list, line, max) => { list.push(String(line).slice(0, 200)); if (list.length > max) list.shift() }
-bot.on('chat', (user, message) => { if (typeof message === 'string') remember(recentChat, `${user === bot.username ? '我' : user}: ${message.slice(0, 80)}`, 8) })
 function describeState(user = currentRequester, query = '') {
   const lessons = query ? experience.recall(goal?.text || query).join('；').slice(0, 500) : ''
-  const stored = bot.entity ? ctx.containers.describe(bot.game?.dimension || 'unknown', bot.entity.position, `${goal?.text || ''} ${query}`).slice(0, 500) : ''
+  const stored = bot.entity ? ctx.containers.describe(dimension() || 'unknown', bot.entity.position, `${goal?.text || ''} ${query}`).slice(0, 500) : ''
   const p = bot.entity?.position
   const time = bot.time?.timeOfDay
   return [
@@ -1998,6 +2076,9 @@ const PREFIXES = ['bot', ...String(process.env.MC_PREFIX || '').split(',').map((
   return false
 }).slice(0, 4)]
 const PREFIX_RE = new RegExp(`^(?:${PREFIXES.join('|')})\\s+`, 'iu') // 唤醒词只含字母数字汉字下划线，不用转义
+function systemFeedback(user, message) {
+  return /^(?:rcon|server|@)$/i.test(String(user).trim()) || /^\[[^\[\]\r\n:：]+[:：][\s\S]*\]$/.test(message.trim())
+}
 function handleChat(user, message, { whisper = false } = {}) {
   Promise.resolve().then(async () => {
     if (user === bot.username || typeof message !== 'string') return
@@ -2016,7 +2097,7 @@ function handleChat(user, message, { whisper = false } = {}) {
     }
     if (!safeMoves || !bot.entity) return say('还没准备好，请等进服后再试')
     console.log(`[command] user=${String(user).slice(0, 32)} cmd=${name.slice(0, 32)}`)
-    const reading = readCommands.has(name) || !!extensionCommands.get(name)?.read || (['mode', 'note', 'goal'].includes(name) && !args.length)
+    const reading = readCommands.has(name) || !!extensionCommands.get(name)?.read || (['mode', 'note', 'goal', 'lessons'].includes(name) && !args.length)
     // 先统一等待自主任务收尾，覆盖自然语言、跟随和工作流等不直接调用 runTask 的入口。
     const preemptable = runtime.status()?.origin === 'auto' && !goal
     if (!stopping && !reading && preemptable) {
@@ -2052,7 +2133,7 @@ function handleChat(user, message, { whisper = false } = {}) {
       const said = []
       sayLog = said
       return Promise.resolve(runtime.scope(() => fn(user, checked.args))).finally(() => { if (sayLog === said) sayLog = null }).then((outcome) => {
-        if (outcome?.stopped || !(outcome?.kind === 'travel' ? !outcome.ok : outcome?.ok === false || said.some((l) => FAILURE.test(l)))) return
+        if (outcome?.stopped || outcome?.replan === false || !(outcome?.kind === 'travel' ? !outcome.ok : outcome?.ok === false || said.some((l) => FAILURE.test(l)))) return
         return replanAfterFailure(user, `${name} ${checked.args.join(' ')}`.trim(), said)
       })
     }
@@ -2064,11 +2145,16 @@ function handleChat(user, message, { whisper = false } = {}) {
     runtime.unscoped(() => say('指令未执行：' + err.message))
   })
 }
-bot.on('chat', handleChat)
-bot.on('chat', (user, message) => { if (user !== bot.username && typeof message === 'string') agentEvents.push('chat', { user: String(user).slice(0, 32), text: message.slice(0, 300) }) })
+bot.on('chat', (user, message) => {
+  if (typeof message !== 'string' || systemFeedback(user, message)) return
+  remember(recentChat, `${user === bot.username ? '我' : user}: ${message.slice(0, 80)}`, 8)
+  if (user === bot.username) return
+  agentEvents.push('chat', { user: String(user).slice(0, 32), text: message.slice(0, 300) })
+  handleChat(user, message)
+})
 // 私聊不用加 bot 前缀
 bot.on('whisper', (user, message) => {
-  if (user === bot.username || typeof message !== 'string') return
+  if (user === bot.username || typeof message !== 'string' || systemFeedback(user, message)) return
   handleChat(user, PREFIX_RE.test(message.trim()) ? message : `bot ${message}`, { whisper: true })
 })
 
@@ -2313,7 +2399,7 @@ function startAgentApi() {
       port: Number(process.env.MC_AGENT_PORT), host: process.env.MC_AGENT_HOST || '127.0.0.1', token: process.env.MC_AGENT_TOKEN, events: agentEvents,
       handlers: {
         state: () => ({
-          username: bot.username, version: bot.version, brand: bot.game?.serverBrand || null, dimension: bot.game?.dimension,
+          username: bot.username, version: bot.version, brand: bot.game?.serverBrand || null, dimension: dimension(),
           position: bot.entity && { x: +bot.entity.position.x.toFixed(1), y: +bot.entity.position.y.toFixed(1), z: +bot.entity.position.z.toFixed(1) },
           health: bot.health, food: bot.food, night: isNight(), busy: busyReason(), queue: queue.length,
           inventory: bot.inventory.items().map((i) => ({ name: i.name, count: i.count })),

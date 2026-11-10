@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const { Vec3 } = require('vec3')
 const { createAutoTravel, POLICY } = require('../auto-travel')
 const { createFlight } = require('../flight')
+const { createRuntime, CancelledError } = require('../runtime')
 const registry = require('minecraft-data')('26.1')
 const Item = require('prismarine-item')('26.1')
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r }); return { promise, resolve } }
@@ -72,6 +73,15 @@ test('near destinations walk without an assessment, equipment write or rocket; f
   assert.deepEqual(h.calls.map(c => c[0]), ['say', 'walk'])
   h.ground({ x: 0.5, y: 64, z: 0.5 })
   assert.equal((await h.travel.travelTo(far, { mode: 'walk', range: 1 })).reason, 'forced_walk')
+})
+
+test('reaching identical XYZ in a different dimension cannot complete travel', async () => {
+  const h = harness({ walk(target, h) { h.ground(target); h.bot.game.dimension = 'the_nether' } })
+  await assert.rejects(h.travel.travelTo(near), { code: 'dimension_changed' })
+  assert.equal(h.travel.status().last, null)
+  const result = await h.travel.travelTo(near)
+  assert.equal(result.ok, true)
+  assert.equal(result.dimension, 'the_nether')
 })
 
 test('long trips choose native flight with protected automatic multi-leg options and cumulative receipts', async () => {
@@ -219,6 +229,45 @@ test('a confirmed stable landing followed by walking can arrive with ordinary wa
     assert.equal(result.ok, true)
     assert.equal(result.transport, 'hybrid')
     assert.equal(h.calls.some(c => c[0] === 'walk'), false)
+  })
+})
+
+test('hybrid walks wait for the final jump within the existing arrival tolerances', async t => {
+  for (const native of [true, false]) await t.test(native ? 'native finish' : 'fallback walk', async t => {
+    const jump = (target, h) => {
+      h.ground({ ...target, y: target.y + 0.8 })
+      h.bot.entity.onGround = false
+    }
+    const input = { fly(target, h) {
+      if (native) jump(target, h)
+      else h.ground({ ...target, x: target.x - 30 })
+      return { landed: true, reason: native ? 'hybrid_arrival' : 'corridor_unsafe',
+        finalApproach: native ? 'walk' : undefined, flightLegs: 1, rocketsUsed: 2 }
+    }, walk: jump }
+    for (const state of ['target', 'outside', 'airborne']) await t.test(state, async t => {
+      const h = harness(input)
+      let elapsed = 0
+      t.mock.method(Date, 'now', () => 1000 + elapsed)
+      h.ctx.delay = async ms => {
+        elapsed += ms
+        if (elapsed >= 150 && state !== 'airborne') h.ground({ ...far, y: far.y + (state === 'outside' ? 5 : 0) })
+      }
+      const result = await h.travel.travelTo(far)
+      assert.equal(result.ok, state === 'target')
+      assert.equal(result.rocketsUsed, 2)
+      const expected = state === 'airborne' ? 2000 : native && state === 'outside' ? 200 : 150
+      assert.equal(elapsed, expected)
+    })
+    await t.test('stop', { timeout: 1000 }, async () => {
+      const h = harness(input), runtime = createRuntime(), waiting = deferred()
+      h.ctx.assertActive = runtime.assertActive
+      h.ctx.delay = ms => { waiting.resolve(); return runtime.delay(ms) }
+      const pending = runtime.runTask('finish', () => h.travel.travelTo(far))
+      await waiting.promise
+      runtime.cancel('stop')
+      await assert.rejects(pending, CancelledError)
+      assert.equal(h.travel.status().last, null)
+    })
   })
 })
 

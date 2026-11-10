@@ -12,6 +12,11 @@ const BREEDABLE = new Set(['cow', 'mooshroom', 'sheep', 'goat', 'pig', 'chicken'
 const DIRECTIONS = { north: 'north', south: 'south', east: 'east', west: 'west', 北: 'north', 南: 'south', 东: 'east', 西: 'west' }
 const CONTROL = /[\p{Cc}\p{Cf}\u2028\u2029]/u
 const CONTROLS = /[\p{Cc}\p{Cf}\u2028\u2029]/gu
+let worldMinY = -64, worldMaxY = 319
+function setWorldBounds(minY, maxY) {
+  if (!Number.isInteger(minY) || !Number.isInteger(maxY) || minY < -2032 || minY >= maxY || maxY > 2031) fail('世界高度范围不合法')
+  worldMinY = minY; worldMaxY = maxY
+}
 
 function getCommand(commands, name) {
   if (!commands || typeof commands !== 'object' || typeof name !== 'string') return null
@@ -204,7 +209,7 @@ function normalizeAction(cmd, args, { ai = false } = {}) {
         if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value)) fail('坐标必须是有限数字')
         return Number(value)
       })
-      if (!coordinates.every(Number.isFinite) || Math.abs(coordinates[0]) > 29_999_984 || Math.abs(coordinates[2]) > 29_999_984 || coordinates[1] < -64 || coordinates[1] > 319) fail('坐标超出世界边界或高度范围')
+      if (!coordinates.every(Number.isFinite) || Math.abs(coordinates[0]) > 29_999_984 || Math.abs(coordinates[2]) > 29_999_984 || coordinates[1] < worldMinY || coordinates[1] > worldMaxY) fail('坐标超出世界边界或高度范围')
       normalized = coordinates.map(String)
     }
   } else if (cmd === 'build' || cmd === 'paste' || cmd === 'circuit' || cmd === 'materials') {
@@ -313,4 +318,4 @@ function createRateLimiter({ limit, windowMs, maxKeys = 256, now = Date.now }) {
   }
 }
 
-module.exports = { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter }
+module.exports = { getCommand, safeChatChunks, normalizeAction, normalizeExtensionArgs, AI_ACTIONS, createRateLimiter, setWorldBounds }

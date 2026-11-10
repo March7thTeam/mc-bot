@@ -107,15 +107,24 @@ function createSkills(bot, ctx) {
     return openRemembered(block)
   }
   // 开箱、关箱时各记一次内容；记忆出错不能影响取放
-  const dimension = () => bot.game?.dimension || 'unknown'
-  function rememberChest(block, chest) {
-    try { ctx.containers?.update(block.position, dimension(), chest.containerItems(), { double: chest.inventoryStart >= 54 }) } catch (err) { ctx.log(`[containers] ${err.message}`) }
-  }
+  const dimension = () => ctx.dimension?.() || bot.game?.dimension || 'unknown'
   async function openRemembered(block) {
+    const openedDimension = dimension(), position = block.position.clone()
     const chest = await bot.openContainer(block)
-    rememberChest(block, chest)
+    ctx.assertActive()
+    const ownsWindow = () => !('currentWindow' in bot) || bot.currentWindow === chest
+    if (dimension() !== openedDimension || !ownsWindow()) throw new Error('容器已关闭或维度已变化')
+    const rememberOpened = () => {
+      try { ctx.containers?.update(position, openedDimension, chest.containerItems(), { double: chest.inventoryStart >= 54 }) }
+      catch (err) { ctx.log(`[containers] ${err.message}`) }
+    }
+    rememberOpened()
     const close = chest.close.bind(chest)
-    chest.close = () => { rememberChest(block, chest); close() }
+    chest.close = () => {
+      if (!ownsWindow() || dimension() !== openedDimension) return
+      rememberOpened()
+      return close()
+    }
     return chest
   }
 
@@ -290,7 +299,7 @@ function createSkills(bot, ctx) {
     if (!validName(name)) return say('地点名需为 1~32 个中文、字母、数字、下划线或短横线')
     if (!Object.hasOwn(places, name) && Object.keys(places).length >= MAX_PLACES) return say('地点已达 64 个，用 bot unmark <地点名> 删除后再记')
     const p = bot.entity.position
-    const value = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), dim: bot.game.dimension }
+    const value = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), dim: dimension() }
     const next = { ...places, [name]: value }
     persistPlaces(next)
     places[name] = value
@@ -308,8 +317,14 @@ function createSkills(bot, ctx) {
 
   async function gotoPlace(name, routeOptions = {}) {
     const p = Object.hasOwn(places, name) && places[name]
-    if (!p) return say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`)
-    if (p.dim && p.dim !== bot.game.dimension) return say(`${name} 不在这个维度`)
+    if (!p) {
+      say(`没记过 ${name}，已有: ${Object.keys(places).join('、') || '无'}`)
+      return { ok: false, error: '没有这个地点', replan: false }
+    }
+    if (p.dim && p.dim !== dimension()) {
+      say(`${name} 不在这个维度`)
+      return { ok: false, error: '地点不在当前维度', replan: false }
+    }
     say(`去 ${name} (${p.x} ${p.y} ${p.z})`)
     if (ctx.travelTo) {
       const result = await ctx.travelTo({ x: p.x, y: p.y, z: p.z }, { range: 1, ...routeOptions })

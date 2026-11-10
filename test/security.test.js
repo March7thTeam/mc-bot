@@ -230,3 +230,23 @@ test('扩展指令参数：最多 8 个、每个 1 到 64 字符、单行', () =
   assert.throws(() => normalizeExtensionArgs(['x'.repeat(65)]), /64/)
   assert.throws(() => normalizeExtensionArgs(['a\u0000b']), /单行/)
 })
+test('世界高度只接受有界整数，失败不改变当前范围，横向和 AI 边界保持', (t) => {
+  const { setWorldBounds } = require('../security')
+  t.after(() => setWorldBounds(-64, 319))
+  setWorldBounds(0, 255)
+  for (const cmd of ['goto', 'walk', 'fly']) {
+    assert.deepEqual(normalizeAction(cmd, ['0', '255', '0']).args, ['0', '255', '0'])
+    invalid(cmd, ['0', '-1', '0'])
+    invalid(cmd, ['0', '256', '0'])
+  }
+  for (const bounds of [[0, 0], [1, 0], [-2033, 255], [0, 2032], [-64.5, 319], [0, 255.5], ['0', 255], [NaN, 319], [0, Infinity]]) {
+    assert.throws(() => setWorldBounds(...bounds), /世界高度/)
+    invalid('goto', ['0', '-1', '0'])
+  }
+  setWorldBounds(-2032, 2031)
+  for (const y of ['-2032', '2031']) assert.equal(normalizeAction('goto', ['0', y, '0'], { ai: true }).args[1], y)
+  invalid('goto', ['29999985', '0', '0'])
+  invalid('goto', ['0', '2032', '0'])
+  invalid('goto', ['0', 'NaN', '0'])
+  assert.throws(() => normalizeAction('fly', ['0', '0', '0'], { ai: true }))
+})

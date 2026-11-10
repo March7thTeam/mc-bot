@@ -116,6 +116,22 @@ Claude Desktop、Cursor 等客户端按各自的方式配置同一条命令即�
 - `features`：服务器规则。`sharedInventory` 和 `sharedHealth` 打开后会写进 AI 的提示。
 - `tips`、`prompt`、`summary`：给 AI 和 `bot tip` 用的知识，有长度上限。
 
+### Refined Storage 3.2.1
+
+Fabric 26.1.2 的隔离服务器上，使用带非空组件的 `/give` 物品捕获了下面 9 个 `set_slot` 样本。它们使用组合字段、可选值、列表或嵌套物品栈，现有扩展的基础类型无法表达。带这些组件的物品在背包或容器包中不受支持。
+
+- `refinedstorage:regulator_upgrade_state`
+- `refinedstorage:security_card_bound_player`
+- `refinedstorage:security_card_permissions`
+- `refinedstorage:configuration_card_state`
+- `refinedstorage:pattern_state`
+- `refinedstorage:crafting_pattern_state`
+- `refinedstorage:processing_pattern_state`
+- `refinedstorage:stonecutter_pattern_state`
+- `refinedstorage:smithing_table_pattern_state`
+
+### JavaScript 扩展
+
 **`.js` 扩展**在数据之外还能写 `setup(api)`：
 
 ```js

@@ -16,7 +16,7 @@ const cleanup = (t, h, ...waits) => t.after(async () => {
   await flush()
 })
 
-function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions, env = {}, savedGoal, agentApi = false } = {}) {
+function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions, env = {}, savedGoal, agentApi = false, realSkills = false, configureBot } = {}) {
   const sent = [], marks = [], calls = [], logs = [], movements = []
   const engines = []
   let apiHandlers = null
@@ -33,6 +33,7 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     stopDigging() {}, clearControlStates() {}, equip: () => calls.push('equip'), quit() {},
     look: async (...args) => calls.push(['look', ...args]), elytraFly: async () => calls.push('glide'),
   })
+  configureBot?.(bot)
   class Movements {
     constructor() { this.canDig = true; this.blocksCantBreak = new Set(); this.exclusionAreasPlace = []; this.scafoldingBlocks = []; this.liquids = new Set() }
     getNeighbors() { return [] }
@@ -45,12 +46,16 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     'mineflayer-pathfinder': { pathfinder() {}, Movements, goals: { GoalNear: class {}, GoalFollow: class {} } },
     'mineflayer-collectblock': { plugin() {} }, 'mineflayer-tool': { plugin() {} }, 'mineflayer-pvp': { plugin() {} },
     minecrafthawkeye: { default() {} }, './fabric': { setupFabric() {}, MODDED_BLOCK_ID: 100000 },
-    './modes': { createModes: () => ({ list() {}, describe: () => [], set: () => true }) },
+    './modes': { createModes: () => ({ list() {}, describe: () => [], set: () => true, recovering: () => !!bot.safetyRecovering }) },
     './combat': { createCombat: () => ({ stop() {}, active: () => false, equipWeapon() {} }) },
     './autonomy': { createDirector: (opts) => require('../autonomy').createDirector({ ...opts, log: (line) => logs.push(line) }) },
     './memory': { list: () => [], add() {} },
-    './storage': { readJSON: (file, fallback) => savedGoal && file.endsWith('/goal.json') ? savedGoal : fallback, writeJSON() {} }, // 别把测试目标写进真实 data/goal.json
-    './ai': { createAI: () => ({ ask: (...args) => { calls.push(['ask', args[0]]); return ask(...args) }, cancel() {}, statistics: () => ({}) }) },
+    './storage': { readJSON: (file, fallback) => {
+      if (savedGoal && file.endsWith('/goal.json')) return savedGoal
+      if (realSkills && file.endsWith('/places.json')) return { 家: { x: 80, y: 64, z: 0, dim: 'overworld' } }
+      return fallback
+    }, writeJSON() {} }, // 别写入真实 data
+    './ai': { createAI: (options) => ({ ask: (...args) => { calls.push(['ask', args[0]]); return ask(...args) }, cancel() {}, statistics: () => ({}), serverNotes: options.getServerNotes }) },
     './skills': { createSkills: (_bot, ctx) => ({
       commands: {
         mark: (u, args) => marks.push([u, ...args]),
@@ -86,12 +91,19 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     process: { env: { DEEPSEEK_API_KEY: 'unit-test-placeholder', ...(agentApi ? { MC_AGENT_PORT: '25599', MC_AGENT_TOKEN: 'unit-test-token-at-least-24-characters' } : {}), ...env }, on() {}, exit() { throw new Error('unexpected process exit') } },
     setTimeout: (fn, ms) => {
       if (fastGoalDelays && ms === 1000) return setImmediate(fn)
+      if (ms === 300) return setImmediate(fn)
       const timer = { fn, ms, cancelled: false, unref() {} }; timers.push(timer); return timer
     },
     clearTimeout: (timer) => { if (timer) timer.cancelled = true },
     setInterval: (fn, ms) => { const timer = { fn, ms, cancelled: false, unref() {} }; intervals.push(timer); return timer },
     clearInterval: (timer) => { if (timer) timer.cancelled = true }, Date, Promise, Buffer, __dirname: root,
   })
+  const loadWithTestStorage = (name) => vm.runInContext(`(() => { const module = { exports: {} }; ${fs.readFileSync(path.join(root, `${name}.js`), 'utf8')}\nreturn module.exports })()`, context)
+  mods['./experience'] = loadWithTestStorage('experience')
+  if (realSkills) {
+    mods['./skills'] = loadWithTestStorage('skills')
+    mods['./containers'] = loadWithTestStorage('containers')
+  }
   vm.runInContext(fs.readFileSync(path.join(root, 'bot.js'), 'utf8'), context, { filename: 'bot.js' })
   if (agentApi) vm.runInContext('startAgentApi()', context)
   bot.emit('spawn')
@@ -113,6 +125,255 @@ test('真实聊天入口拒绝原型名、保护最终片段，之后合法玩�
   assert.ok(h.sent.every((s) => !s.startsWith('/') && !s.includes('\n')))
   assert.deepEqual(h.marks, [['AnotherPlayer', '家']])
   assert.equal(h.calls.length, 0)
+})
+
+test('系统反馈不会触发聊天或私聊指令、点名或 agent 事件', async t => {
+  for (const event of ['chat', 'whisper']) await t.test(event, async () => {
+    const h = harness()
+    for (const user of ['Rcon', 'rCoN', 'Server', 'sErVeR', '@']) {
+      h.bot.emit(event, user, 'Made UnitBot a server operator')
+      h.bot.emit(event, user, 'bot mark No')
+    }
+    for (const message of ['[Rcon: Made UnitBot a server operator]', ' [Admin: bot mark No] ', '[管理员：UnitBot 已传送]']) {
+      h.bot.emit(event, 'Anyone', message)
+    }
+    await flush()
+    assert.deepEqual(h.sent, [])
+    assert.deepEqual(h.marks, [])
+    assert.equal(h.calls.some(c => Array.isArray(c) && c[0] === 'ask'), false)
+    assert.equal(h.logs.some(line => /\[(?:mention|command)\]/.test(line)), false)
+    assert.equal(h.inner('recentChat.length'), 0)
+    assert.equal(h.inner("agentEvents.since(0).filter(e => e.type === 'chat').length"), 0)
+    h.bot.emit(event, 'Player', 'bot mark Home')
+    await flush()
+    assert.deepEqual(h.marks, [['Player', 'Home']])
+    h.bot.emit('chat', 'Player', 'UnitBot 在吗')
+    await flush()
+    assert.ok(h.logs.includes('[mention] user=Player'))
+  })
+})
+
+test('go 在真实技能、execStep 和 API 回执中拒绝未知或跨维度地点', async () => {
+  const h = harness({ realSkills: true, agentApi: true, routeHook: async () => ({ kind: 'travel', ok: true, transport: 'walk' }) })
+  h.bot.game.dimension = 'the_nether'
+  const result = await h.apiHandlers.command({ cmd: 'go', args: ['家'], wait: true })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, '地点不在当前维度')
+  const unknown = await h.inner("runtime.scope(() => execStep('Player', 'go', ['未知']))")
+  assert.equal(unknown.ok, false)
+  assert.equal(unknown.error, '没有这个地点')
+  h.bot.emit('chat', 'Player', 'bot goto 家')
+  await flush()
+  assert.equal(h.calls.some(c => ['ask', 'travelTo'].includes(c[0])), false)
+  h.bot.game.dimension = 'overworld'
+  assert.equal((await h.apiHandlers.command({ cmd: 'go', args: ['家'], wait: true })).ok, true)
+  assert.equal(h.calls.filter(c => c[0] === 'travelTo').length, 1)
+})
+
+test('出生和换维度刷新版本事实、旧名与坐标边界', (t) => {
+  const { setWorldBounds, normalizeAction } = require('../security')
+  t.after(() => { setWorldBounds(-64, 319); require('../knowledge').useVersion(null) })
+  const log = { id: 17, name: 'log' }
+  const h = harness({ configureBot(bot) {
+    bot.version = '1.8.8'
+    bot.supportFeature = require('minecraft-data')('1.8.8').supportFeature
+    bot.registry.itemsByName.log = bot.registry.blocksByName.log = log
+    bot.game.minY = 0; bot.game.height = 256
+  } })
+  assert.equal(h.bot.registry.itemsByName.oak_log, log)
+  assert.equal(h.bot.registry.blocksByName.oak_log, log)
+  assert.ok(h.logs.some(line => line.includes('[version] 1.8.8：世界 0~255')))
+  assert.match(h.inner('ai').serverNotes(), /没有副手.*没有攻击冷却/)
+  assert.throws(() => normalizeAction('goto', ['0', '-1', '0']))
+  h.bot.game = { dimension: 'custom:low', minY: -128, height: 512 }
+  h.bot.emit('game')
+  assert.equal(normalizeAction('goto', ['0', '-128', '0']).args[1], '-128')
+  assert.match(h.inner('ai').serverNotes(), /世界高度 -128~383/)
+})
+
+test('真实 craft 从橡木原木补齐临时工作台用掉的木板，按完整数量匹配配方', async () => {
+  const registry = require('prismarine-registry')('26.1.2')
+  const { Recipe } = require('prismarine-recipe')(registry)
+  const log = registry.itemsByName.oak_log.id, chest = registry.itemsByName.chest.id
+  const table = registry.itemsByName.crafting_table.id, inventory = new Map([[log, 16]])
+  const inv = new EventEmitter()
+  const p = new Vec3(1, 64, 0)
+  let placed = false
+  inv.count = (id) => inventory.get(id) || 0
+  inv.items = () => [...inventory].filter(([, count]) => count > 0).map(([type, count]) => ({ type, name: registry.items[type].name, count }))
+  const h = harness({ agentApi: true, configureBot(bot) {
+    bot.entity.position = new Vec3(0.5, 64, 0.5)
+    bot.registry = registry
+    bot.inventory = inv
+    bot.findBlocks = ({ matching }) => placed && matching === registry.blocksByName.crafting_table.id ? [p] : []
+    bot.blockAt = (at) => ({ name: placed && at.equals(p) ? 'crafting_table' : at.y < 64 ? 'stone' : 'air', position: at,
+      boundingBox: placed && at.equals(p) || at.y < 64 ? 'block' : 'empty' })
+    bot.placeBlock = async () => { assert.equal(inv.count(table), 1); inventory.set(table, 0); placed = true }
+    bot.recipesAll = (id) => Recipe.find(id, null)
+    bot.recipesFor = (id, _meta, count, station) => Recipe.find(id, null).filter(recipe =>
+      (station || !recipe.requiresTable) && recipe.delta.every(d => inv.count(d.id) + d.count * Math.ceil(count / recipe.result.count) >= 0))
+    bot.craft = async (recipe, times) => {
+      for (const d of recipe.delta) inventory.set(d.id, inv.count(d.id) + d.count * times)
+    }
+  } })
+  const result = await h.apiHandlers.command({ cmd: 'craft', args: ['chest', '2'], wait: true })
+  assert.equal(result.ok, true)
+  assert.equal(inv.count(chest), 2)
+  assert.equal(inv.count(log), 11)
+  assert.equal(placed, true)
+})
+
+test('寻路被自保抢占时先等脱险，再重试同一个目标', { timeout: 2500 }, async () => {
+  const h = harness(), calls = [], ready = deferred()
+  const goal = { x: 0, y: 64, z: 5 }
+  h.bot.entity.position = new Vec3(0, 64, 0)
+  h.bot.pathfinder.goto = async (g) => {
+    calls.push(g)
+    if (calls.length > 1) return
+    h.bot.safetyRecovering = true
+    ready.resolve()
+    throw Object.assign(new Error('safety takeover'), { name: 'GoalChanged' })
+  }
+  const pending = h.inner('runTask')('test travel', () => h.inner('travel')(goal))
+  await ready.promise
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(calls.length, 1)
+  h.bot.safetyRecovering = false
+  assert.equal((await pending).ok, true)
+  assert.deepEqual(calls, [goal, goal])
+})
+
+test('长时间未脱离危险结束赶路回执，保留自保控制', { timeout: 2500 }, async t => {
+  const h = harness(), ready = deferred()
+  h.bot.entity.position = new Vec3(0, 64, 0)
+  let now = Date.now(), attempts = 0
+  t.mock.method(Date, 'now', () => now)
+  h.bot.pathfinder.goto = async () => {
+    attempts++
+    h.bot.safetyRecovering = true
+    ready.resolve()
+    throw Object.assign(new Error('safety takeover'), { name: 'GoalChanged' })
+  }
+  const pending = h.inner("runTask('test travel', () => travel({ x: 0, y: 64, z: 5 }))")
+  await ready.promise
+  await flush()
+  now += 15_001
+  assert.equal((await pending).error, '未脱离危险，自保仍在尝试')
+  assert.equal(attempts, 1)
+  assert.equal(h.bot.safetyRecovering, true)
+})
+
+test('深水漂浮先上岸再挖，浅水脚踩地时不游岸，空的采集回执不计成功', async t => {
+  for (const deep of [true, false]) await t.test(deep ? 'deep' : 'shallow', async () => {
+    const p = new Vec3(2, 64, 0), inv = new EventEmitter(), calls = []
+    const target = { position: p, type: 1, name: 'dirt', canHarvest: () => true }
+    let dug = false
+    inv.items = () => []
+    const h = harness({ configureBot(bot) {
+      bot.entity = { position: new Vec3(0.5, 64, 0.5), isInWater: true, onGround: !deep }
+      bot.inventory = inv
+      bot.registry.blocks = { 1: { name: 'dirt' } }
+      bot.registry.blocksByName.lava = { id: 2 }
+      bot.findBlocks = () => [p]
+      bot.blockAt = (at) => at.equals(p) && !dug ? target : { type: 0, name: 'air', boundingBox: 'empty' }
+      bot.collectBlock.collect = async () => { calls.push('collect'); dug = deep }
+    } })
+    h.bot.swim = async () => { calls.push('shore'); h.bot.entity.isInWater = false; h.bot.entity.onGround = true }
+    const result = await h.inner("leaveWater = bot.swim; runTask('test mine', async () => { const result = await mineIds([1], 1); return { ok: result.got === 1, ...result } })")
+    assert.equal(result.got, Number(deep))
+    assert.equal(result.ok, deep)
+    assert.deepEqual(calls, deep ? ['shore', 'collect'] : ['collect'])
+  })
+})
+
+test('同类型的不同 level 同步取消旧任务，普通 game 和重复 respawn 不会取消', async (t) => {
+  const taskWait = deferred()
+  const h = harness({ taskWait, configureBot(bot) {
+    bot._client = new EventEmitter()
+    bot._client.on('respawn', () => { bot.emit('game'); bot.emit('respawn') })
+  } })
+  cleanup(t, h, taskWait)
+  const runtime = h.inner('runtime')
+  const generation = runtime.generation()
+  h.bot.emit('chat', 'Player', 'bot smelt iron_ingot')
+  await flush()
+  h.bot.emit('game')
+  h.bot._client.emit('respawn', { worldState: { name: 'minecraft:overworld' } })
+  assert.equal(runtime.generation(), generation)
+  h.bot._client.emit('respawn', { worldState: { name: 'custom:other_overworld' } })
+  assert.equal(runtime.generation(), generation + 1)
+  h.bot.emit('spawn')
+  assert.equal(runtime.generation(), generation + 1)
+  taskWait.resolve()
+  await flush()
+  assert.ok(h.logs.includes('[task] end test cancelled=true'))
+  assert.ok(!h.calls.includes('equip'))
+  h.bot.emit('chat', 'Player', 'bot smelt iron_ingot')
+  await flush()
+  assert.ok(h.calls.includes('equip'))
+})
+
+test('维度切换取消未返回的 AI、首次跟随或已绑定跟随，以及旧站岗点', async (t) => {
+  for (const mode of ['ai', 'before_tick', 'after_tick', 'stay']) await t.test(mode, async t => {
+    const waiting = deferred(), h = harness({ ask: () => waiting.promise })
+    cleanup(t, h, waiting)
+    h.bot.players.Player = { entity: { id: 9, position: new Vec3(4, 64, 0) } }
+    if (mode === 'ai') h.bot.emit('chat', 'Player', 'bot 帮我记下位置')
+    else h.bot.emit('chat', 'Player', mode === 'stay' ? 'bot stay' : 'bot follow')
+    await flush()
+    if (mode === 'after_tick') h.inner('companion.tick()')
+    if (mode === 'stay') assert.ok(h.inner('post'))
+    if (mode.includes('tick')) assert.equal(h.inner('followTarget'), 'Player')
+    h.bot.game.dimension = 'the_nether'
+    h.bot.emit('game')
+    assert.equal(h.inner('followTarget'), null)
+    assert.equal(h.inner('post'), null)
+    assert.equal(h.bot.pathfinder.goal, null)
+    if (mode === 'ai') waiting.resolve({ actions: [{ cmd: 'mark', args: ['旧坐标'] }], done: true })
+    await flush()
+    assert.deepEqual(h.marks, [])
+    h.bot.emit('chat', 'Player', 'bot follow')
+    await flush()
+    h.inner('companion.tick()')
+    assert.equal(h.inner('followTarget'), 'Player')
+  })
+})
+
+test('旧箱窗口自动关闭或延迟 finally 都不影响新维度同坐标箱子', async t => {
+  for (const autoClose of [true, false]) await t.test(autoClose ? 'server close' : 'finally only', async t => {
+    const pending = deferred(), p = new Vec3(2, 64, 0), closed = []
+    const h = harness({ realSkills: true, agentApi: true, configureBot(bot) {
+      bot.registry.itemsByName = { dirt: { id: 1 }, stone: { id: 2 } }
+      bot.currentWindow = null
+      bot.findBlock = () => ({ position: p, name: 'chest' })
+      bot.openContainer = async () => {
+        const dim = bot.game.dimension
+        const chest = new EventEmitter()
+        Object.assign(chest, {
+          containerItems: () => [{ name: dim === 'overworld' ? 'dirt' : 'stone', count: 2 }],
+          inventoryStart: 27,
+          close() { closed.push(dim); bot.currentWindow = null },
+          withdraw: () => dim === 'overworld' ? pending.promise : Promise.resolve(),
+        })
+        return (bot.currentWindow = chest)
+      }
+    } })
+    cleanup(t, h, pending)
+    const old = h.apiHandlers.command({ cmd: 'withdraw', args: ['dirt'], wait: true })
+    await flush()
+    assert.ok(h.bot.currentWindow)
+    if (autoClose) { h.bot.emit('windowClose', h.bot.currentWindow); h.bot.currentWindow = null }
+    h.bot.game.dimension = 'the_nether'
+    h.bot.emit('game')
+    pending.resolve()
+    assert.equal((await old).stopped, true)
+    assert.equal((await h.apiHandlers.command({ cmd: 'withdraw', args: ['stone'], wait: true })).ok, true)
+    assert.deepEqual(closed, ['the_nether'])
+    const containers = h.inner('ctx.containers')
+    assert.equal(containers.find('dirt', 'the_nether', p).length, 0)
+    assert.equal(containers.find('dirt', 'overworld', p).length, 1)
+    assert.equal(containers.find('stone', 'the_nether', p).length, 1)
+  })
 })
 
 test('stop 在模型响应前到达时，真实调度器不执行旧回复或旧动作', async () => {
@@ -604,6 +865,21 @@ test('私聊来的查询指令私聊回，公屏来的仍回公屏；私聊不�
   h.bot.emit('whisper', 'Asker', 'say /op Asker')
   await flush()
   assert.ok(h.sent.every((s) => !s.startsWith('/')), h.sent.join(' | '))
+})
+
+test('lessons 无参数沿用请求通道，lessons clear 仍是写指令', async () => {
+  const h = harness()
+  h.bot.emit('whisper', 'Asker', 'lessons')
+  await flush()
+  assert.deepEqual(h.sent, ['/msg Asker 还没有经验'])
+  h.sent.length = 0
+  h.bot.emit('chat', 'Asker', 'bot lessons')
+  await flush()
+  assert.deepEqual(h.sent, ['还没有经验'])
+  h.sent.length = 0
+  h.bot.emit('whisper', 'Asker', 'lessons clear')
+  await flush()
+  assert.deepEqual(h.sent, ['经验清空了'])
 })
 
 test('水里：站在坑底可以挖出去，浮在深水里仍不许挖放', () => {

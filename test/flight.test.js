@@ -272,6 +272,68 @@ test('removed, duplicate, mismatched and malformed fireworks patches cannot fall
   for (const item of malformed) assert.equal(guidance.validRocket(item, '26.1'), false)
 })
 
+// 只在这个隔离模块里放开版本门，验证将来人工加白名单后的格式分支；生产白名单不变。
+function probeGuidance() {
+  const fs = require('node:fs'), vm = require('node:vm'), filename = require.resolve('../flight-guidance')
+  const module = { exports: {} }
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module, Map, require: (name) => name === './versions'
+    ? { ...require('../versions'), flightVerified: () => true } : require(name) }, { filename })
+  return module.exports
+}
+function nbtRocket(version, flight = 1, explosions) {
+  return { name: version === '1.12.2' || version === '1.8.8' ? 'fireworks' : 'firework_rocket', count: 2,
+    nbt: { type: 'compound', ...(version === '1.12.2' ? { name: '' } : {}), value: { Fireworks: { type: 'compound', value: {
+      Flight: { type: 'byte', value: flight }, ...(explosions === undefined ? {} : { Explosions: explosions }),
+    } } } } }
+}
+
+for (const version of ['1.8.8', '1.12.2']) {
+  test(`${version} 实测形状的 NBT 只认时长 1 和无爆炸，生产版本门保持关闭`, () => {
+    const probe = probeGuidance(), ordinary = nbtRocket(version), empty = { type: 'list', value: { type: 'compound', value: [] } }
+    assert.equal(probe.validRocket(ordinary, version), true)
+    assert.equal(probe.validRocket(nbtRocket(version, 1, empty), version), true)
+    assert.equal(probe.validRocket(nbtRocket(version, 1, { type: 'list', value: { type: 'end', value: [] } }), version), true)
+    assert.equal(guidance.validRocket(ordinary, version), false)
+    assert.equal(guidance.rocketCount({ version, inventory: { items: () => [ordinary] } }), 0)
+    for (const flight of [0, 2, 3, '1', null, NaN]) assert.equal(probe.validRocket(nbtRocket(version, flight), version), false)
+    for (const explosions of [null, {}, [], { type: 'list', value: [] }, { type: 'list', value: { type: 'compound', value: [{}] } },
+      { type: 'list', value: { type: 'compound', value: [{ Type: { type: 'byte', value: 0 } }] } }]) {
+      assert.equal(probe.validRocket(nbtRocket(version, 1, explosions), version), false)
+    }
+    for (const nbt of [null, 1, [], {}, { value: null }, { type: 'compound', value: { Fireworks: null } },
+      { type: 'compound', value: { Fireworks: { type: 'compound', value: { Flight: { type: 'string', value: 1 } } } } }]) {
+      assert.equal(probe.validRocket({ ...ordinary, nbt }, version), false)
+    }
+    assert.equal(probe.validRocket({ ...ordinary, name: ordinary.name === 'fireworks' ? 'firework_rocket' : 'fireworks' }, version), false)
+    for (const count of [0, -1, 65, 1.5, '2', NaN]) assert.equal(probe.validRocket({ ...ordinary, count }, version), false)
+  })
+}
+
+for (const version of ['1.16.5', '1.20.4']) {
+  test(`${version} 的真实 NBT Slot 只认显式时长 1 和无爆炸`, () => {
+    const data = require('minecraft-data')(version), VersionItem = require('prismarine-item')(version)
+    const makeRocket = nbtData => VersionItem.fromNotch({ present: true, itemId: data.itemsByName.firework_rocket.id, itemCount: 2, nbtData })
+    const valid = makeRocket(nbtRocket(version).nbt)
+    assert.equal(guidance.validRocket(valid, version), true)
+    assert.equal(guidance.rocketCount({ version, inventory: { items: () => [valid] } }), 2)
+    assert.equal(guidance.validRocket(makeRocket(null), version), false)
+    assert.equal(guidance.validRocket(makeRocket(nbtRocket(version, 2).nbt), version), false)
+    const explosive = { type: 'list', value: { type: 'compound', value: [{}] } }
+    assert.equal(guidance.validRocket(makeRocket(nbtRocket(version, 1, explosive).nbt), version), false)
+  })
+}
+
+test('1.21.4 原版组件空补丁和显式时长 1 可以使用，其余时长或爆炸拒绝', () => {
+  const version = '1.21.4', data = require('minecraft-data')(version), VersionItem = require('prismarine-item')(version)
+  const makeRocket = (fireworks) => VersionItem.fromNotch({ itemId: data.itemsByName.firework_rocket.id, itemCount: 2,
+    components: fireworks ? [{ type: 'fireworks', data: fireworks }] : [], removeComponents: [] })
+  assert.equal(guidance.validRocket(makeRocket(), version), true)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 1, explosions: [] }), version), true)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 3, explosions: [] }), version), false)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 1, explosions: [{}] }), version), false)
+  assert.equal(guidance.validRocket(nbtRocket('1.20.4'), '26.1'), false)
+})
+
 test('native flight performs confirmed takeoff, awaits equip, uses hand rocket and resolves only after stable landing', async () => {
   const h = harness()
   const outcome = await h.flight.fly(goal)

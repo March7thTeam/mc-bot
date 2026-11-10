@@ -5,14 +5,18 @@
 //   4. 其他敌对生物：近战（也帮附近被怪贴身的玩家）
 //   5. 骑乘怪：同步骑手坐标后按骑手打；拿不到骑手时打坐骑
 const { goals } = require('mineflayer-pathfinder')
+const { versionFacts } = require('./versions')
 
 const HOSTILE = new Set(['zombie', 'husk', 'drowned', 'skeleton', 'stray', 'bogged', 'parched', 'spider', 'cave_spider',
   'creeper', 'witch', 'slime', 'magma_cube', 'phantom', 'pillager', 'vindicator', 'evoker', 'vex', 'ravager', 'zombie_villager',
   'silverfish', 'endermite', 'blaze', 'wither_skeleton', 'piglin_brute', 'hoglin', 'zoglin', 'breeze', 'guardian'])
 const SKELETONS = new Set(['skeleton', 'stray', 'bogged', 'parched']) // parched：26.1 沙漠里的骷髅变种
+const RANGED = new Set([...SKELETONS, 'pillager'])
+const UNSAFE_GROUND = /lava|fire|magma_block|cactus|powder_snow|sweet_berry_bush|pointed_dripstone/
 // 骑乘怪（僵尸马骑士、骷髅陷阱马、骆驼尸壳骑手…）：服务器不给乘客单独发移动包，
 // mineflayer 里骑手的位置一直停在上马那一刻，距离判断和追击都错。坐骑一动就把乘客坐标同步到坐骑上方。
 const MOUNTS = new Set(['zombie_horse', 'skeleton_horse', 'camel_husk', 'zombie_nautilus', 'spider', 'chicken', 'horse', 'camel', 'nautilus', 'strider'])
+const mobName = (entity) => String(entity.name || '').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()
 const MATERIAL_RANK = ['wooden', 'golden', 'stone', 'iron', 'diamond', 'netherite']
 const LOW_HP = 8
 const CREEPER_SWELL = 16 // 实体元数据：苦力怕膨胀状态，1 = 正在点燃（实测 26.1）
@@ -29,6 +33,9 @@ function createCombat(bot, ctx) {
   let mode = null // 'retreat' | 'flee' | 'shoot' | 'melee' | 'watch'
   let shooting = false
   let blocking = false
+  let equippingShield = false
+  let retreatArchers = []
+  let retreatMovement = null
   let lastHit = 0
   let lastHurt = 0
   let generation = 0
@@ -50,18 +57,19 @@ function createCombat(bot, ctx) {
   const dist = (e) => e.position.distanceTo(bot.entity.position)
   const count = (name) => bot.inventory.items().filter((i) => i.name === name).reduce((n, i) => n + i.count, 0)
   const hasBow = () => count('bow') > 0 && count('arrow') > 0
+  const hasOffhand = () => bot.supportFeature ? !bot.supportFeature('doesntHaveOffHandSlot') : versionFacts(bot).offhand
   const nearest = (filter, range) => bot.nearestEntity((e) => filter(e) && dist(e) < range && !isIgnored(e))
   const offHand = () => bot.inventory.slots[45]
 
   bot.on('entityMoved', (vehicle) => {
-    if (!vehicle.passengers?.length || !MOUNTS.has(vehicle.name)) return
+    if (!vehicle.passengers?.length || !MOUNTS.has(mobName(vehicle))) return
     for (const rider of vehicle.passengers) {
       if (rider === bot.entity || !bot.entities[rider.id]) continue
       rider.position = vehicle.position.offset(0, (vehicle.height ?? 1.4) * 0.75, 0)
     }
   })
   // 骑手被打死/下马后，坐骑本身：无人骑的僵尸马不主动攻击，不追
-  const mountedThreat = (e) => MOUNTS.has(e.name) && e.passengers?.some((r) => HOSTILE.has(r.name))
+  const mountedThreat = (e) => MOUNTS.has(mobName(e)) && e.passengers?.some((r) => HOSTILE.has(mobName(r)))
 
   bot.on('auto_shot_stopped', () => { shooting = false })
   bot.on('entityHurt', (e) => { if (e === bot.entity) lastHurt = Date.now() })
@@ -73,9 +81,16 @@ function createCombat(bot, ctx) {
     if (best && bot.heldItem?.name !== best.name) await bot.equip(best, 'hand').catch(() => {})
   }
   async function equipShield() {
-    if (offHand()?.name === 'shield') return
+    if (!hasOffhand() || equippingShield || offHand()?.name === 'shield') return
     const shield = bot.inventory.items().find((i) => i.name === 'shield')
-    if (shield) await bot.equip(shield, 'off-hand').catch(() => {})
+    if (!shield) return
+    equippingShield = true
+    try { await bot.equip(shield, 'off-hand') } catch {} finally { equippingShield = false }
+  }
+  function releaseShield() {
+    if (!blocking) return
+    blocking = false
+    if (!ctx.isEating?.() && offHand()?.name === 'shield' && bot.usingHeldItem !== false) bot.deactivateItem()
   }
 
   function stopShooting() {
@@ -89,14 +104,88 @@ function createCombat(bot, ctx) {
   // 和怪保持距离：GoalInvert(GoalFollow) 会一直往远离它的方向走
   // 每 250ms 评估一次，已经在躲同一只就别换目标：每次 setGoal 都丢掉路径重算，人走走停停（实测只有 1.6 格/秒，被追上炸）
   let flight = null // { goal, id, range }
-  function fleeFrom(mob, range, why) {
+  function stopMelee() {
+    if (!bot.pvp.target) return
     bot.pvp.stop()
+    // Consume the plugin's pending path stop before assigning the retreat goal.
+    bot.pathfinder.setGoal(null)
+  }
+  function fleeFrom(mob, range, why) {
+    stopMelee()
     stopShooting()
     if (mode !== why) ctx.log(`[combat] ${why}: 躲开 ${mob.name}`)
     begin(why)
     if (flight?.id === mob.id && flight.range === range && bot.pathfinder.goal === flight.goal) return
     flight = { id: mob.id, range, goal: new goals.GoalInvert(new goals.GoalFollow(mob, range)) }
     bot.pathfinder.setGoal(flight.goal, true)
+  }
+
+  function visibleFrom(mob, position) {
+    if (!bot.world?.raycast) return true
+    const eye = mob.position.offset(0, mob.eyeHeight ?? (mob.height ?? 1.8) * 0.85, 0)
+    // A lip that hides the feet alone won't block an arrow at the torso or head.
+    return [0.8, 1.6].some((height) => {
+      const delta = position.offset(0, height, 0).minus(eye), range = delta.norm()
+      return range < 0.2 || !bot.world.raycast(eye, delta.scaled(1 / range), range - 0.1)
+    })
+  }
+
+  function findCover(archers, threats, moves) {
+    if (!archers.length || !moves || !bot.pathfinder.getPathFromTo) return null
+    const origin = bot.entity.position, base = origin.floored(), options = []
+    for (const radius of [6, 10]) for (let step = 0; step < 8; step++) {
+      const angle = step * Math.PI / 4, dx = Math.round(radius * Math.cos(angle)), dz = Math.round(radius * Math.sin(angle))
+      for (const dy of [0, 1, -1]) {
+        const cell = base.offset(dx, dy, dz)
+        const floor = bot.blockAt(cell.offset(0, -1, 0)), feet = bot.blockAt(cell), head = bot.blockAt(cell.offset(0, 1, 0))
+        if (floor?.boundingBox !== 'block' || feet?.boundingBox !== 'empty' || head?.boundingBox !== 'empty' ||
+            [floor, feet, head].some(b => UNSAFE_GROUND.test(b.name) || b.name === 'water')) continue
+        const point = cell.offset(0.5, 0, 0.5)
+        const clearance = Math.min(...threats.map(mob => mob.position.distanceTo(point)))
+        if (clearance < 5 || threats.some(mob => mob.position.distanceTo(point) < Math.min(6, dist(mob)))) continue
+        const exposed = archers.filter(mob => visibleFrom(mob, point)).length
+        if (exposed < archers.length) options.push({ cell, point, exposed, clearance, distance: origin.distanceTo(point) })
+      }
+    }
+    options.sort((a, b) => a.exposed - b.exposed || a.distance - b.distance || b.clearance - a.clearance)
+    for (const candidate of options.slice(0, 4)) {
+      const { x, y, z } = candidate.cell, goal = new goals.GoalBlock(x, y, z)
+      const path = bot.pathfinder.getPathFromTo(moves, origin, goal, { timeout: 30, tickTimeout: 12, searchRadius: 20 }).next().value?.result
+      if (path?.status === 'success' && path.path.length > 0) return { goal, point: candidate.point }
+    }
+    return null
+  }
+
+  function retreat(threats, archers) {
+    const exposed = archers.filter(mob => visibleFrom(mob, bot.entity.position))
+    const near = threats.find(mob => !RANGED.has(mobName(mob)) || exposed.includes(mob))
+    retreatArchers = exposed
+    if (!near) {
+      if (mode) end()
+      return ctx.autoEat(true)
+    }
+    if (mode !== 'retreat') generation++ // Cancel pending weapon-equip/attack continuations.
+    if (exposed.length) equipShield()
+    stopMelee()
+    stopShooting()
+    const moves = ctx.retreatMoves?.(), owner = ctx.movementOwner?.()
+    if (moves && bot.pathfinder.movements !== moves) {
+      retreatMovement = { moves, previous: bot.pathfinder.movements, owner }
+      bot.pathfinder.setMovements(moves)
+    }
+    if (flight?.cover && bot.pathfinder.goal === flight.goal && Date.now() - flight.started < 4000 &&
+        !threats.some(mob => mob.position.distanceTo(flight.cover) < 4)) return
+    if (flight?.id === near.id && bot.pathfinder.goal === flight.goal && Date.now() - flight.started < 1500) return
+    const cover = findCover(exposed, threats, moves)
+    if (!cover) {
+      fleeFrom(near, RANGED.has(mobName(near)) ? 24 : 16, 'retreat')
+      flight.started = Date.now()
+      return
+    }
+    begin('retreat')
+    flight = { goal: cover.goal, cover: cover.point, started: Date.now() }
+    ctx.log(`[combat] retreat: 转移到掩体 ${cover.point.floored()}`)
+    bot.pathfinder.setGoal(cover.goal)
   }
   function shoot(mob) {
     begin('shoot')
@@ -155,16 +244,16 @@ function createCombat(bot, ctx) {
 
   setInterval(() => {
     if (!enabled || !bot.entity || ctx.paused?.()) return
-    const threat = (range) => nearest((e) => HOSTILE.has(e.name), range)
 
-    if (bot.health <= LOW_HP) {
-      const near = threat(10) || nearest((e) => SKELETONS.has(e.name), 16) // 骷髅在远处也照射不误
-      if (near) { if (SKELETONS.has(near.name)) equipShield(); return fleeFrom(near, 16, 'retreat') }
-      if (mode) end()
-      return ctx.autoEat(true)
+    if (bot.health <= 12) {
+      const threats = Object.values(bot.entities).filter((mob) => mob.isValid !== false && HOSTILE.has(mobName(mob)) &&
+        dist(mob) < (RANGED.has(mobName(mob)) ? 24 : 10)).sort((a, b) => dist(a) - dist(b))
+      const archers = threats.filter(mob => RANGED.has(mobName(mob)))
+      if (bot.health <= LOW_HP || mode === 'retreat' || archers.length >= 2 || (archers.length && threats.length >= 3)) return retreat(threats, archers)
     }
+    if (mode === 'retreat') end()
 
-    const creeper = nearest((e) => e.name === 'creeper', 10)
+    const creeper = nearest((e) => mobName(e) === 'creeper', 10)
     if (creeper) return handleCreeper(creeper)
 
     // 骷髅射程远：血够就 14 格内主动处理；刚被射中就扩大到 24 格找它
@@ -173,7 +262,7 @@ function createCombat(bot, ctx) {
     // 要保护的玩家：跟随对象 + 附近的队友（血量够时）。怪贴近他们也算威胁
     const guardees = ctx.protectees?.() || []
     const nearGuardee = (e, r) => dist(e) < 20 && guardees.some((g) => e.position.distanceTo(g.position) < r)
-    const skel = nearest((e) => SKELETONS.has(e.name) && (dist(e) < skelRange || nearGuardee(e, 10)), 24)
+    const skel = nearest((e) => SKELETONS.has(mobName(e)) && (dist(e) < skelRange || nearGuardee(e, 10)), 24)
     if (skel) {
       equipShield()
       if (hasBow() && dist(skel) > 8) return shoot(skel)
@@ -181,7 +270,7 @@ function createCombat(bot, ctx) {
     }
 
     // 幻翼在天上飞，追不到（日志里一直"够不着"）：只在它俯冲到身边时砍一下，不移动
-    const phantom = nearest((e) => e.name === 'phantom', 3.5)
+    const phantom = nearest((e) => mobName(e) === 'phantom', 3.5)
     if (phantom && Date.now() - lastHit > 600) {
       begin('melee')
       const run = generation
@@ -192,8 +281,10 @@ function createCombat(bot, ctx) {
       }).catch((err) => ctx.log(`[combat] ${err.message}`))
       return
     }
-    const mob = nearest((e) => HOSTILE.has(e.name) && !SKELETONS.has(e.name) && e.name !== 'creeper' && e.name !== 'phantom' &&
-      (dist(e) < 6 || nearGuardee(e, 8)), 20)
+    const mob = nearest((e) => {
+      const name = mobName(e)
+      return HOSTILE.has(name) && !SKELETONS.has(name) && name !== 'creeper' && name !== 'phantom' && (dist(e) < 6 || nearGuardee(e, 8))
+    }, 20)
     if (mob) return melee(mob)
     // 骑手位置拿不到（还没同步）时，至少把冲过来的坐骑当威胁处理：打马会把骑手摔下来
     const mount = nearest((e) => mountedThreat(e) && (dist(e) < 5 || nearGuardee(e, 6)), 20)
@@ -204,14 +295,18 @@ function createCombat(bot, ctx) {
 
   // 举盾：追骷髅的路上举着，贴脸了放下来砍
   bot.on('physicsTick', () => {
-    if (ctx.paused?.()) return
+    if (ctx.paused?.() || !hasOffhand()) return releaseShield()
     const t = bot.pvp.target
-    // 血少撤退时如果骷髅在附近也举盾（日志：撤退途中被骷髅射死）
-    const archer = mode === 'retreat' && bot.nearestEntity((e) => SKELETONS.has(e.name) && dist(e) < 16)
+    // 盾只能挡前方。背向弓手时收盾，以全速拉开距离。
+    const archerAhead = mode === 'retreat' && retreatArchers.some((mob) => {
+      const p = bot.entity.position, yaw = bot.entity.yaw
+      const dx = mob.position.x - p.x, dz = mob.position.z - p.z
+      return -Math.sin(yaw) * dx - Math.cos(yaw) * dz > 0.25 * Math.hypot(dx, dz)
+    })
     // 吃东西时不举盾：举盾/放下会打断进食（日志：撤退中连续"吃东西超时"后被射死）
-    const want = !ctx.isEating?.() && offHand()?.name === 'shield' && ((!!t && SKELETONS.has(t.name) && dist(t) > 3.5) || !!archer)
+    const want = !ctx.isEating?.() && offHand()?.name === 'shield' && ((!!t && SKELETONS.has(mobName(t)) && dist(t) > 3.5) || archerAhead)
     if (want && !blocking) { bot.activateItem(true); blocking = true }
-    if (!want && blocking) { bot.deactivateItem(); blocking = false }
+    if (!want) releaseShield()
   })
 
   function end() {
@@ -220,6 +315,14 @@ function createCombat(bot, ctx) {
     mode = null
     bot.pvp.stop()
     stopShooting()
+    if (flight && bot.pathfinder.goal === flight.goal) bot.pathfinder.setGoal(null)
+    flight = null
+    if (retreatMovement?.previous && retreatMovement.owner === ctx.movementOwner?.() && bot.pathfinder.movements === retreatMovement.moves) {
+      bot.pathfinder.setMovements(retreatMovement.previous)
+    }
+    retreatMovement = null
+    retreatArchers = []
+    releaseShield()
     ctx.onCombatOver()
   }
 
