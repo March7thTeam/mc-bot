@@ -85,7 +85,7 @@ test('钓鱼只尝试拾取收竿产生的掉落，并区分收到拾取事件�
     })
     assert.equal((await commands.fish(null, ['1'])).ok, picked)
     assert.deepEqual(said, [`钓到 1 次，确认收进背包 ${Number(picked)} 次`])
-    assert.equal(visited.length, 1)
+    assert.equal(visited.length, picked ? 1 : 2)
     assert.equal(bot.entities[2], unrelated)
     assert.equal(bot.listenerCount('playerCollect'), 0)
   })

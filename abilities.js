@@ -367,18 +367,38 @@ function createAbilities(bot, ctx) {
       if (!bit) { bot.activateItem(); await sleepMs(800); continue }
       caught++
       const existing = new Set(Object.values(bot.entities)), drops = new Set()
+      const before = new Map()
+      for (const { name, count } of bot.inventory.items()) before.set(name, (before.get(name) || 0) + count)
       const hook = bobber.position.clone()
       const track = (entity) => {
         if (isDrop(entity) && !existing.has(entity) && entity.position.distanceTo(hook) <= 3) drops.add(entity)
       }
       let picked = false
-      const onCollect = (player, item) => { if (player === bot.entity && drops.has(item)) picked = true }
+      const takenByOthers = new Set()
+      const onCollect = (player, item) => {
+        if (!drops.has(item)) return
+        if (player === bot.entity) picked = true
+        else takenByOthers.add(item)
+      }
       bot.on('entitySpawn', track)
       bot.on('playerCollect', onCollect)
       try {
         bot.activateItem() // 收竿
-        await sleepMs(900)
-        if (!picked) await collectDrops([...drops], 6)
+        // 鱼获会从浮漂飞回来。等落点接近稳定，再以最新位置寻路；物品弹落或漂动时补一次。
+        for (let tick = 0; tick < 8 && !picked; tick++) await sleepMs(250)
+        for (let attempt = 0; attempt < 2 && !picked && [...drops].some(item => bot.entities[item.id] === item); attempt++) {
+          await collectDrops([...drops], 6)
+          if (!picked) await sleepMs(500)
+        }
+        if (!picked && drops.size) {
+          await ctx.inventorySettled?.()
+          picked = [...drops].some(item => {
+            if (bot.entities[item.id] === item || takenByOthers.has(item)) return false
+            let stack
+            try { stack = item.getDroppedItem?.() } catch { return false }
+            return stack?.name && itemCount(stack.name) > (before.get(stack.name) || 0)
+          })
+        }
         if (picked) collected++
       } finally {
         bot.removeListener('entitySpawn', track)
