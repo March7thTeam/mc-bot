@@ -96,3 +96,27 @@ test('危险反射：有防火只躲岩浆；赶路途中踩过岩浆块不打�
   assert.equal(escaped((h) => { at(h, 'magma_block', 'fire'); h.bot.entity.effects[12] = { id: 12 } }), false)
   assert.equal(escaped((h) => { at(h, 'stone', 'lava'); h.bot.entity.effects[12] = { id: 12 } }), true)
 })
+
+test('岩浆边缘安全落脚不抢寻路，实际接触接管一次并在脱险后交回', () => {
+  const h = harness()
+  h.bot.registry = { effectsByName: {} }
+  const e = h.bot.entity, goal = { name: 'travel' }
+  e.onGround = true
+  h.bot.pathfinder.goal = goal
+  h.moving(true)
+  h.bot.blockAt = (p) => ({ name: p.y < 64 ? 'lava' : 'stone_slab', boundingBox: p.y < 64 ? 'empty' : 'block' })
+  h.tick()
+  assert.equal(h.bot.pathfinder.goal, goal)
+  assert.equal(h.goals.length, 0)
+  e.isInLava = true
+  h.tick()
+  assert.equal(h.modes.recovering(), true)
+  const escape = h.bot.pathfinder.goal
+  h.advance(1000); h.tick()
+  assert.equal(h.bot.pathfinder.goal, escape)
+  assert.equal(h.goals.length, 1)
+  e.isInLava = false
+  h.tick()
+  assert.equal(h.bot.pathfinder.goal, null)
+  assert.ok(!h.modes.recovering())
+})

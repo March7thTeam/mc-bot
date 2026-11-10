@@ -46,7 +46,7 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     'mineflayer-pathfinder': { pathfinder() {}, Movements, goals: { GoalNear: class {}, GoalFollow: class {} } },
     'mineflayer-collectblock': { plugin() {} }, 'mineflayer-tool': { plugin() {} }, 'mineflayer-pvp': { plugin() {} },
     minecrafthawkeye: { default() {} }, './fabric': { setupFabric() {}, MODDED_BLOCK_ID: 100000 },
-    './modes': { createModes: () => ({ list() {}, describe: () => [], set: () => true }) },
+    './modes': { createModes: () => ({ list() {}, describe: () => [], set: () => true, recovering: () => !!bot.safetyRecovering }) },
     './combat': { createCombat: () => ({ stop() {}, active: () => false, equipWeapon() {} }) },
     './autonomy': { createDirector: (opts) => require('../autonomy').createDirector({ ...opts, log: (line) => logs.push(line) }) },
     './memory': { list: () => [], add() {} },
@@ -200,6 +200,26 @@ test('真实 craft 从橡木原木补齐临时工作台用掉的木板，按完�
   assert.equal(inv.count(chest), 2)
   assert.equal(inv.count(log), 11)
   assert.equal(placed, true)
+})
+
+test('寻路被自保抢占时先等脱险，再重试同一个目标', { timeout: 2500 }, async () => {
+  const h = harness(), calls = [], ready = deferred()
+  const goal = { x: 0, y: 64, z: 5 }
+  h.bot.entity.position = new Vec3(0, 64, 0)
+  h.bot.pathfinder.goto = async (g) => {
+    calls.push(g)
+    if (calls.length > 1) return
+    h.bot.safetyRecovering = true
+    ready.resolve()
+    throw Object.assign(new Error('safety takeover'), { name: 'GoalChanged' })
+  }
+  const pending = h.inner('runTask')('test travel', () => h.inner('travel')(goal))
+  await ready.promise
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(calls.length, 1)
+  h.bot.safetyRecovering = false
+  assert.equal((await pending).ok, true)
+  assert.deepEqual(calls, [goal, goal])
 })
 
 test('同类型的不同 level 同步取消旧任务，普通 game 和重复 respawn 不会取消', async (t) => {

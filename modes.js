@@ -15,10 +15,24 @@ function createModes(bot, ctx) {
   const enabled = { self_preservation: true, unstuck: true, item_collecting: false, idle_staring: true, elbow_room: false, sleep_with_players: true }
   const DANGER = new Set(['lava', 'fire', 'soul_fire', 'magma_block', 'campfire', 'soul_campfire'])
 
-  // 离开当前位置一段距离（GoalInvert：离目标点越远越好）
-  const moveAway = (dist) => {
+  let evasion = null
+  const recovering = () => evasion && evasion.generation === ctx.generation() && evasion.activity === ctx.activityId?.()
+  function moveAway(dist, reason) {
+    if (recovering() && Date.now() - evasion.started < 4000) return
+    if (recovering() && bot.pathfinder.goal === evasion.goal && bot.pathfinder.isMoving()) return
     const p = bot.entity.position
-    bot.pathfinder.setGoal(new goals.GoalInvert(new goals.GoalNear(p.x, p.y, p.z, dist)))
+    const goal = new goals.GoalInvert(new goals.GoalNear(p.x, p.y, p.z, dist))
+    evasion = { goal, started: Date.now(), generation: ctx.generation(), activity: ctx.activityId?.() }
+    ctx.log(`[mode] 危险（${reason}），跑开`)
+    if (bot.pvp.target) { bot.pvp.stop(); bot.pathfinder.setGoal(null) }
+    bot.pathfinder.setGoal(goal)
+  }
+  function finishEvasion() {
+    if (!recovering()) { evasion = null; return }
+    const goal = evasion.goal
+    evasion = null
+    if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(null)
+    if (!ctx.busy()) ctx.resume()
   }
 
   // 这一列往上是连续的水，顶上露天（没被冰、石头盖住）
@@ -52,12 +66,16 @@ function createModes(bot, ctx) {
     return id !== undefined && !!bot.entity.effects?.[id]
   }
   function hazard(feet, below) {
-    const lava = [feet, below].find((b) => b?.name === 'lava')
-    if (lava) return 'lava'
+    const e = bot.entity
+    if (e.isInLava || feet?.name === 'lava') return 'lava'
+    if (below?.name === 'lava' && !e.onGround && e.velocity?.y < -0.08) {
+      const predicted = e.position.plus(e.velocity.scaled(2))
+      if (bot.blockAt(predicted.offset(0, -0.2, 0))?.name === 'lava') return 'lava'
+    }
     if (fireResistant()) return null
-    const hot = [feet, below].find((b) => DANGER.has(b?.name))
+    const hot = [feet, below].find((b) => b?.name !== 'lava' && DANGER.has(b?.name))
     if (hot && !(hot === below && hot.name === 'magma_block' && bot.pathfinder.isMoving())) return hot.name
-    return bot.entity.onFire ? '着火' : null
+    return e.onFire && !bot.pathfinder.isMoving() && !recovering() ? '着火' : null
   }
 
   const modes = {
@@ -66,8 +84,7 @@ function createModes(bot, ctx) {
       const below = bot.blockAt(bot.entity.position.offset(0, -1, 0))
       const danger = hazard(feet, below)
       if (danger) {
-        ctx.log(`[mode] 危险（${danger}），跑开`)
-        moveAway(5)
+        moveAway(5, danger)
         return true
       }
       // 头顶有沙子/砂砾正在掉（参考 Mindcraft self_preservation）
@@ -75,11 +92,12 @@ function createModes(bot, ctx) {
       const falling = bot.nearestEntity((e) => e.name === 'falling_block' && Math.abs(e.position.x - p.x) < 1.2 &&
         Math.abs(e.position.z - p.z) < 1.2 && e.position.y > p.y && e.position.y - p.y < 6)
       if (falling) {
-        ctx.log('[mode] 头顶掉方块，躲开')
-        moveAway(3)
+        moveAway(3, '头顶掉方块')
         return true
       }
       const inWater = feet?.name === 'water' || bot.entity.isInWater
+      if (recovering() && bot.entity.onGround === false && !inWater) return true
+      finishEvasion()
       if (inWater && (bot.oxygenLevel ?? 20) < 15) {
         bot.setControlState('jump', true) // 往上浮
         // 头顶被冰或石头盖住，光上浮出不去：游向最近能露头的水面，没有就挖开头顶
@@ -265,11 +283,13 @@ function createModes(bot, ctx) {
   }, 1000)
 
   return {
+    recovering,
     list: () => Object.keys(modes).map((n) => `${n}:${enabled[n] ? '开' : '关'}`).join(' '),
     describe: () => Object.entries(DESCRIPTIONS).map(([n, d]) => `${n}(${enabled[n] ? '开' : '关'}) ${d}`),
     set(name, on) {
       if (!Object.hasOwn(enabled, name)) return false
       enabled[name] = on
+      if (name === 'self_preservation' && !on) finishEvasion()
       return true
     },
   }

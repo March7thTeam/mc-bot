@@ -420,7 +420,7 @@ async function gotoWatched(goal) {
   const watch = setInterval(() => {
     const p = bot.entity.position
     if (p.distanceTo(spot) > 1) { spot = p.clone(); spotAt = Date.now() }
-    if (combat.active() || eating || bot.targetDigBlock || dist() < best - 3) { best = Math.min(best, dist()); bestAt = Date.now(); spotAt = Date.now() }
+    if (combat.active() || modes.recovering?.() || eating || bot.targetDigBlock || dist() < best - 3) { best = Math.min(best, dist()); bestAt = Date.now(); spotAt = Date.now() }
     // 寻路算不出更近的点时路径是空的：人不动、不报错，goto 也不会返回。空等 20 秒就够了
     const idle = !bot.pathfinder.isMoving() && Date.now() - spotAt > IDLE_MS
     if (idle || Date.now() - bestAt > NO_PROGRESS_MS) {
@@ -494,6 +494,7 @@ async function travel(goal) {
       }
       const interrupted = ['GoalChanged', 'PathStopped'].includes(err.name)
       if (!interrupted || attempt >= 5 || run !== actionRun || !task) throw err
+      while (modes.recovering?.()) await sleepMs(150)
       if (combat.active()) await combat.waitOver()
       await sleepMs(300)
     }
@@ -946,7 +947,9 @@ let followTarget = null // 正在跟随的玩家，打完架恢复跟随
 let followDistance = 2
 let post = null // bot stay 设下的站岗位置，打完架走回去
 const combat = createCombat(bot, {
-  paused: () => !!flight?.active() || !!parkour?.inJump(),
+  paused: () => !!flight?.active() || !!parkour?.inJump() || !!modes.recovering?.(),
+  retreatMoves: () => safeMoves,
+  movementOwner: () => `${runtime.generation()}:${runtime.status()?.id ?? 0}`,
   autoEat: (force) => autoEat(force),
   isEating: () => eating,
   log: (...a) => console.log(...a),
@@ -1456,7 +1459,7 @@ commands.walk = (_user, args) => {
 const companion = createCompanion(bot, {
   say, dimension, log: (...args) => console.log(...args),
   getFollow: () => followTarget && ({ name: followTarget, distance: followDistance }),
-  paused: () => runtime.busy() || combat.active() || eating || !!flight?.active(),
+  paused: () => runtime.busy() || combat.active() || eating || !!flight?.active() || !!modes.recovering?.(),
   followEntity: (entity, distance) => { bot.pathfinder.setMovements(safeMoves); bot.pathfinder.setGoal(new goals.GoalFollow(entity, distance), true) },
   pauseFollow: () => bot.pathfinder.setGoal(null),
   clearFollow: (reason) => { followTarget = null; bot.pathfinder.setGoal(null); say(reason) },
