@@ -767,7 +767,7 @@ async function craftItem(name, count, depth) {
   const shortfall = (r) => {
     const times = Math.ceil(count / r.result.count)
     return r.delta.filter((d) => d.count < 0)
-      .map((d) => ({ id: d.id, need: -d.count * times - bot.inventory.count(d.id, null) }))
+      .map((d) => ({ id: d.id, need: -d.count * times - bot.inventory.count(d.id, d.metadata) }))
       .filter((d) => d.need > 0)
   }
   const ranked = all.map((r) => ({ r, miss: shortfall(r) }))
@@ -776,14 +776,16 @@ async function craftItem(name, count, depth) {
   // 报第一个（缺得最少、最可能成功的）配方的失败原因：后面的备选配方只会报"缺黑石"之类，掩盖真正原因
   let firstErr = null
   const fail = (msg) => { firstErr ||= msg }
-  for (const { r, miss } of ranked) {
-    if (miss.length && depth >= 3) continue
-    let ok = true
-    for (const d of miss) {
+  async function prepareIngredients(missing) {
+    if (missing.length && depth >= 3) return false
+    for (const d of missing) {
       const sub = bot.registry.items[d.id].name
-      if (await craftItem(sub, d.need, depth + 1)) { ok = false; fail(`缺 ${sub}`); break }
+      if (await craftItem(sub, d.need, depth + 1)) { fail(`缺 ${sub}`); return false }
     }
-    if (!ok) continue
+    return true
+  }
+  for (const { r, miss } of ranked) {
+    if (!await prepareIngredients(miss)) continue
     if (r.requiresTable && !table) {
       table = await getTable(depth)
       if (!table) { fail(bot.inventory.count(bot.registry.itemsByName.crafting_table.id) ? '身边没地方放工作台（换个开阔的地方）' : '没有工作台，也做不出来'); continue }
@@ -796,17 +798,20 @@ async function craftItem(name, count, depth) {
         table = await getTable(depth, false) // 走不过去就在身边放一个新的
         if (!table) { fail('工作台走不过去，也放不了新的'); continue }
       }
+      // 临时做的工作台可能吃掉本配方已经准备好的木板。
+      if (!await prepareIngredients(shortfall(r))) continue
     }
     // 用 mineflayer 重新取一次配方，确保材料就绪
     await inventorySettled()
     // 共享背包下背包内 2x2 合成不稳定（日志：多次 "updateSlot:0 did not fire"），手边有工作台就一律用工作台
     const reach = (t) => t && t.position.distanceTo(bot.entity.position) < 4
     let station = r.requiresTable ? table : (reach(findTable()) ? findTable() : null)
-    let ready = bot.recipesFor(item.id, null, 1, station)[0]
+    let ready = bot.recipesFor(item.id, null, count, station)[0]
     if (!ready) continue
     try {
       await bot.craft(ready, Math.ceil(count / ready.result.count), station)
     } catch (err) {
+      runtime.assertActive()
       if (!/did not fire|updateSlot|missing ingredient/.test(err.message)) throw err
       console.log(`[craft] ${name} 背包没同步（${station ? '工作台' : '背包合成'}），清理后用工作台重试`)
       runtime.unscoped(() => bot.closeWindow(bot.inventory)) // 关一次背包界面，服务器会把合成格里残留的材料退回背包
@@ -815,7 +820,7 @@ async function craftItem(name, count, depth) {
       if (station) await travel(new goals.GoalNear(station.position.x, station.position.y, station.position.z, 2)).catch(() => {})
     // 先确认能靠近工作台，避免不可达时仍等待 windowOpen 超时。
       if (station && bot.entity.position.distanceTo(station.position.offset(0.5, 0.5, 0.5)) > 4.5) return `够不着工作台（${fmt(station.position)}），走不过去`
-      ready = bot.recipesFor(item.id, null, 1, station)[0]
+      ready = bot.recipesFor(item.id, null, count, station)[0]
       if (!ready) return '背包同步后材料不够了'
       await bot.craft(ready, Math.ceil(count / ready.result.count), station)
     }

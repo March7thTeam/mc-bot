@@ -1,6 +1,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { Vec3 } = require('vec3')
+const { EventEmitter } = require('node:events')
 const { createAbilities } = require('../abilities')
 const { createRuntime, CancelledError } = require('../runtime')
 const registry = require('minecraft-data')('26.1')
@@ -54,4 +55,38 @@ test('get 中断后按真实背包补足原总目标，物品被拿走后再次�
   assert.equal((await h.commands.get(null, ['diamond', '10'])).ok, true)
   assert.equal(inv.diamond, 10)
   assert.deepEqual(counts, [10, 4, 7])
+})
+
+test('钓鱼只尝试拾取收竿产生的掉落，并区分收到拾取事件和鱼留在地上', async t => {
+  for (const picked of [true, false]) await t.test(picked ? 'collected' : 'still on ground', async () => {
+    const bot = new EventEmitter(), p = new Vec3(0, 64, 0), said = [], visited = []
+    const bobber = { id: 1, name: 'fishing_bobber', position: p.offset(3, 0, 0), metadata: [] }
+    bobber.metadata[registry.entitiesByName.fishing_bobber.metadataKeys.indexOf('biting')] = true
+    const unrelated = { id: 2, name: 'item', position: bobber.position.clone() }
+    const catchDrop = { id: 3, name: 'item', position: bobber.position.clone() }
+    let casts = 0
+    Object.assign(bot, {
+      entity: { position: p }, registry, entities: { 2: unrelated },
+      inventory: { items: () => [{ name: 'fishing_rod', count: 1 }] },
+      findBlock: () => ({ position: p.offset(3, -1, 0) }),
+      nearestEntity: (fn) => Object.values(bot.entities).find(fn),
+      equip: async () => {}, lookAt: async () => {}, activateItem() {
+        if (++casts === 1) bot.entities[1] = bobber
+        else { delete bot.entities[1]; bot.entities[3] = catchDrop; bot.emit('entitySpawn', catchDrop) }
+      },
+    })
+    const { commands } = createAbilities(bot, {
+      say: (line) => said.push(line), runTask: (_name, fn) => fn(), assertActive() {}, stillRunning: () => true,
+      sleepMs: async () => {}, travel: async (goal) => {
+        if (casts !== 2) return
+        visited.push(goal)
+        if (picked) { bot.emit('playerCollect', bot.entity, catchDrop); delete bot.entities[3] }
+      },
+    })
+    assert.equal((await commands.fish(null, ['1'])).ok, picked)
+    assert.deepEqual(said, [`钓到 1 次，确认收进背包 ${Number(picked)} 次`])
+    assert.equal(visited.length, 1)
+    assert.equal(bot.entities[2], unrelated)
+    assert.equal(bot.listenerCount('playerCollect'), 0)
+  })
 })

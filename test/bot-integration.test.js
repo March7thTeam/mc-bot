@@ -91,6 +91,7 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     process: { env: { DEEPSEEK_API_KEY: 'unit-test-placeholder', ...(agentApi ? { MC_AGENT_PORT: '25599', MC_AGENT_TOKEN: 'unit-test-token-at-least-24-characters' } : {}), ...env }, on() {}, exit() { throw new Error('unexpected process exit') } },
     setTimeout: (fn, ms) => {
       if (fastGoalDelays && ms === 1000) return setImmediate(fn)
+      if (ms === 300) return setImmediate(fn)
       const timer = { fn, ms, cancelled: false, unref() {} }; timers.push(timer); return timer
     },
     clearTimeout: (timer) => { if (timer) timer.cancelled = true },
@@ -167,6 +168,38 @@ test('go 在真实技能、execStep 和 API 回执中拒绝未知或跨维度地
   h.bot.game.dimension = 'overworld'
   assert.equal((await h.apiHandlers.command({ cmd: 'go', args: ['家'], wait: true })).ok, true)
   assert.equal(h.calls.filter(c => c[0] === 'travelTo').length, 1)
+})
+
+test('真实 craft 从橡木原木补齐临时工作台用掉的木板，按完整数量匹配配方', async () => {
+  const registry = require('prismarine-registry')('26.1.2')
+  const { Recipe } = require('prismarine-recipe')(registry)
+  const log = registry.itemsByName.oak_log.id, chest = registry.itemsByName.chest.id
+  const table = registry.itemsByName.crafting_table.id, inventory = new Map([[log, 16]])
+  const inv = new EventEmitter()
+  const p = new Vec3(1, 64, 0)
+  let placed = false
+  inv.count = (id) => inventory.get(id) || 0
+  inv.items = () => [...inventory].filter(([, count]) => count > 0).map(([type, count]) => ({ type, name: registry.items[type].name, count }))
+  const h = harness({ agentApi: true, configureBot(bot) {
+    bot.entity.position = new Vec3(0.5, 64, 0.5)
+    bot.registry = registry
+    bot.inventory = inv
+    bot.findBlocks = ({ matching }) => placed && matching === registry.blocksByName.crafting_table.id ? [p] : []
+    bot.blockAt = (at) => ({ name: placed && at.equals(p) ? 'crafting_table' : at.y < 64 ? 'stone' : 'air', position: at,
+      boundingBox: placed && at.equals(p) || at.y < 64 ? 'block' : 'empty' })
+    bot.placeBlock = async () => { assert.equal(inv.count(table), 1); inventory.set(table, 0); placed = true }
+    bot.recipesAll = (id) => Recipe.find(id, null)
+    bot.recipesFor = (id, _meta, count, station) => Recipe.find(id, null).filter(recipe =>
+      (station || !recipe.requiresTable) && recipe.delta.every(d => inv.count(d.id) + d.count * Math.ceil(count / recipe.result.count) >= 0))
+    bot.craft = async (recipe, times) => {
+      for (const d of recipe.delta) inventory.set(d.id, inv.count(d.id) + d.count * times)
+    }
+  } })
+  const result = await h.apiHandlers.command({ cmd: 'craft', args: ['chest', '2'], wait: true })
+  assert.equal(result.ok, true)
+  assert.equal(inv.count(chest), 2)
+  assert.equal(inv.count(log), 11)
+  assert.equal(placed, true)
 })
 
 test('同类型的不同 level 同步取消旧任务，普通 game 和重复 respawn 不会取消', async (t) => {

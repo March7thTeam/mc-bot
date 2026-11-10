@@ -150,6 +150,13 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
     guard(bot.collectBlock, ['collect'])
     guard(bot.pvp, ['attack'])
     guard(bot.hawkEye, ['oneShot', 'autoAttack'])
+    if (typeof bot.closeWindow === 'function') {
+      const close = bot.closeWindow
+      bot.closeWindow = function (...args) {
+        const scope = storage.getStore()
+        if (!scope || scope.worldEpoch === worldEpoch) return close.apply(this, args)
+      }
+    }
     for (const name of ['openContainer', 'openFurnace']) {
       const original = bot[name]
       if (!original) continue

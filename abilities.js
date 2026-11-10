@@ -36,6 +36,12 @@ const DIRS = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] }
 const LIQUID = new Set(['lava', 'water'])
 const UNBREAKABLE = new Set(['bedrock', 'barrier', 'end_portal_frame', 'reinforced_deepslate', 'modded_block', 'spawner'])
 const SIX = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+const isDrop = (entity) => /^(item|item_stack)$/i.test(entity.name || '')
+
+// Path nodes use integer feet Y, which can differ from the actual feet on farmland/slabs.
+class GoalPickup extends goals.GoalNear {
+  isEnd(node) { return node.x === this.x && node.z === this.z && Math.abs(node.y - this.y) <= 1 }
+}
 
 function createAbilities(bot, ctx) {
   const { say, runTask, travel, sleepMs, fmt } = ctx
@@ -198,14 +204,16 @@ function createAbilities(bot, ctx) {
   }
 
   // ---- 掉落物：走过去捡（种田、剪羊毛之后用）----
-  async function collectDrops(center, radius, reach = 0.5) {
-    const items = Object.values(bot.entities).filter((e) => e.name === 'item' && e.position.distanceTo(center) < radius)
-    for (const it of items.slice(0, 24)) {
-      if (!ctx.stillRunning()) return
-      if (!bot.entities[it.id]) continue
-      await travel(new goals.GoalNear(it.position.x, it.position.y, it.position.z, reach)).catch(() => {})
+  async function collectDrops(items, limit = 24) {
+    for (const it of items.filter((e) => bot.entities[e.id] === e).sort((a, b) => dist(a) - dist(b)).slice(0, limit)) {
+      ctx.assertActive()
+      if (bot.entities[it.id] !== it) continue
+      const { x, y, z } = it.position
+      try { await travel(new GoalPickup(x, y, z, 0.5)) } catch { ctx.assertActive() }
+      if (bot.entities[it.id] === it && dist(it) < 2) await sleepMs(300)
     }
   }
+  const nearbyDrops = (center, radius) => Object.values(bot.entities).filter((e) => isDrop(e) && e.position.distanceTo(center) < radius)
 
   // ---- 种田 ----
   async function farm(radius) {
@@ -213,11 +221,13 @@ function createAbilities(bot, ctx) {
     const center = bot.entity.position.clone()
     let harvested = 0
     let planted = 0
+    let remainingDrops = 0
     // 别踩耕地：跳上去会把耕地踩回泥土、作物掉落（实测 9 株只收到 3 株）。寻路时踩耕地/作物代价很高
     const moves = bot.pathfinder.movements
     // 寻路查的是脚所在那格：收割后那格是空气，耕地在脚下，也要避开（实测：踩上刚收完的田跳了一下，踩坏 1 块）
     const onFarmland = (b) => b?.position && bot.blockAt(b.position.offset(0, -1, 0))?.name === 'farmland'
-    const avoidFarmland = (b) => (b && (b.name === 'farmland' || CROPS[b.name] || onFarmland(b)) ? Infinity : 0)
+    let collecting = false
+    const avoidFarmland = (b) => (b && (b.name === 'farmland' || CROPS[b.name] || onFarmland(b)) ? (collecting ? 2 : Infinity) : 0)
     moves?.exclusionAreasStep.push(avoidFarmland)
     try {
     for (let n = 0; n < 64 && ctx.stillRunning(); n++) {
@@ -231,9 +241,29 @@ function createAbilities(bot, ctx) {
       await sleepMs(250)
       if (await plant(pos, crop.seed)) planted++
     }
-    // 捡掉落物也不能踩田：门槛 1.2 格，站田边就能吸到（实测：捡东西时跳上耕地踩坏了 1 块）
-    // 先捡再补种：收割时种子还在地上，手里没种子的那几格要靠这一轮补（实测：收 8 株只种下 5 处）
-    await collectDrops(center, radius + 2, 1.2)
+    // 先收掉落再补种。耕地可平走，禁止跳上或落到田里，也不挖路、搭方块或冲刺。
+    const items = nearbyDrops(center, radius + 2)
+    const saved = moves && { getNeighbors: moves.getNeighbors, canDig: moves.canDig,
+      allowParkour: moves.allowParkour, allowSprinting: moves.allowSprinting, scafoldingBlocks: moves.scafoldingBlocks }
+    collecting = true
+    if (moves) Object.assign(moves, { canDig: false, allowParkour: false, allowSprinting: false, scafoldingBlocks: [],
+      getNeighbors(node) {
+        return saved.getNeighbors.call(this, node).filter((next) => {
+          const dest = this.getBlock(next, 0, -1, 0)
+          if (dest.name !== 'farmland') return true
+          const floor = this.getBlock(node, 0, -1, 0)
+          return next.y === node.y && floor.physical && Math.abs(floor.height - dest.height) <= 0.25 &&
+            Math.max(Math.abs(next.x - node.x), Math.abs(next.z - node.z)) === 1
+        })
+      },
+    })
+    try {
+      await collectDrops(items, 48)
+      remainingDrops = items.filter((e) => bot.entities[e.id] === e).length
+    } finally {
+      if (moves) Object.assign(moves, saved)
+      collecting = false
+    }
     // 空着的耕地也种上（有什么种子种什么）
     const farmland = reg().blocksByName.farmland.id
     const empty = bot.findBlocks({ matching: farmland, maxDistance: radius, count: 64 })
@@ -249,7 +279,7 @@ function createAbilities(bot, ctx) {
       const i = moves?.exclusionAreasStep.indexOf(avoidFarmland)
       if (i >= 0) moves.exclusionAreasStep.splice(i, 1)
     }
-    say(harvested || planted ? `收了 ${harvested} 株作物，种下 ${planted} 处` : `${radius} 格内没有成熟的作物或空耕地`)
+    say(harvested || planted ? `收了 ${harvested} 株作物，种下 ${planted} 处${remainingDrops ? `，附近还有 ${remainingDrops} 堆掉落物` : ''}` : `${radius} 格内没有成熟的作物或空耕地`)
   }
   async function plant(cropPos, seed) {
     const soil = bot.blockAt(cropPos.offset(0, -1, 0))
@@ -301,7 +331,7 @@ function createAbilities(bot, ctx) {
       if (await useOnEntity(sheep, ['shears'])) done++
       await sleepMs(300)
     }
-    await collectDrops(center, 18)
+    await collectDrops(nearbyDrops(center, 18))
     say(done ? `剪了 ${done} 只羊` : '16 格内没有能剪的羊')
   }
 
@@ -323,7 +353,7 @@ function createAbilities(bot, ctx) {
     })
     if (!water) return say('16 格内没有露天的水')
     await travel(new goals.GoalNear(water.position.x, water.position.y + 1, water.position.z, 3))
-    let caught = 0
+    let caught = 0, collected = 0
     for (let i = 0; i < times && ctx.stillRunning(); i++) {
       await bot.equip(findItem(['fishing_rod']), 'hand')
       await bot.lookAt(water.position.offset(0.5, 0.8, 0.5), true)
@@ -334,11 +364,29 @@ function createAbilities(bot, ctx) {
       const deadline = Date.now() + 45_000
       while (Date.now() < deadline && ctx.stillRunning() && bot.entities[bobber.id] && meta(bobber, 'biting') !== true) await sleepMs(100)
       const bit = meta(bobber, 'biting') === true
-      bot.activateItem() // 收竿
-      if (bit) caught++
-      await sleepMs(800)
+      if (!bit) { bot.activateItem(); await sleepMs(800); continue }
+      caught++
+      const existing = new Set(Object.values(bot.entities)), drops = new Set()
+      const hook = bobber.position.clone()
+      const track = (entity) => {
+        if (isDrop(entity) && !existing.has(entity) && entity.position.distanceTo(hook) <= 3) drops.add(entity)
+      }
+      let picked = false
+      const onCollect = (player, item) => { if (player === bot.entity && drops.has(item)) picked = true }
+      bot.on('entitySpawn', track)
+      bot.on('playerCollect', onCollect)
+      try {
+        bot.activateItem() // 收竿
+        await sleepMs(900)
+        if (!picked) await collectDrops([...drops], 6)
+        if (picked) collected++
+      } finally {
+        bot.removeListener('entitySpawn', track)
+        bot.removeListener('playerCollect', onCollect)
+      }
     }
-    say(caught ? `钓到 ${caught} 次` : '一条都没钓到')
+    say(caught ? `钓到 ${caught} 次，确认收进背包 ${collected} 次` : '一条都没钓到')
+    return { ok: caught > 0 && caught === collected }
   }
 
   // ---- 挖掘 ----
