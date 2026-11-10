@@ -76,8 +76,8 @@ test('别名不覆盖现有键，现代注册表不加别名，缺失旧名不�
 })
 
 test('自动飞行按已验收的具体版本放行', () => {
-  for (const version of ['1.21.4', '26.1', '26.1.1', '26.1.2']) assert.equal(flightVerified(version), true)
-  for (const version of ['1.8.8', '1.12.2', '1.20.4', '1.21.3', '1.21.5', '26.1.3', undefined, null, 775]) assert.equal(flightVerified(version), false)
+  for (const version of ['1.16.5', '1.20.4', '1.21.4', '26.1', '26.1.2']) assert.equal(flightVerified(version), true)
+  for (const version of ['1.8.8', '1.12.2', '1.16.4', '1.20.3', '1.21.3', '1.21.5', '26.1.1', '26.1.3', undefined, null, 775]) assert.equal(flightVerified(version), false)
 })
 
 for (const version of ['1.8.8', '1.12.2']) {
@@ -136,4 +136,17 @@ test('矩阵按旧名解析多行背包并在场地加载后才搭建和读回',
     })
     assert.equal(commands.some(cmd => cmd.startsWith('forceload')), version === '26.1.2')
   }
+})
+
+test('矩阵只认本轮机器人指定的僵尸计分板，支持旧 RCON 拼接回执', () => {
+  const { commandsFor, parseZombieScore } = require('../scripts/lab/version-matrix')
+  assert.equal(commandsFor('1.8.8').zombieCriterion, 'stat.killEntity.Zombie')
+  assert.equal(commandsFor('1.13.2').zombieCriterion, 'minecraft.killed:minecraft.zombie')
+  assert.equal(parseZombieScore('Showing 1 tracked objective(s) for VersionLabBot- vm_zombie_kills: 0 (vm_zombie_kills)', false), 0)
+  assert.equal(parseZombieScore('Showing 1 tracked objective(s) for VersionLabBot\n- §avm_zombie_kills: 1 (vm_zombie_kills)', false), 1)
+  assert.equal(parseZombieScore('VersionLabBot has 1 [vm_zombie_kills]\n', true), 1)
+  assert.throws(() => parseZombieScore('SomePlayer has 1 [vm_zombie_kills]', true))
+  assert.throws(() => parseZombieScore('VersionLabBot has 1 [other]', true))
+  assert.throws(() => parseZombieScore('- vm_zombie_kills: 1 (other)', false))
+  assert.throws(() => parseZombieScore("Can't get value of vm_zombie_kills for VersionLabBot; none is set", true))
 })

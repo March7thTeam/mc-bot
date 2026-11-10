@@ -233,7 +233,7 @@ test('26.1 actual item components accept only nonexplosive Flight 1 and read com
 })
 
 test('known 26.1 default component patches accept ordinary rockets; unknown versions never assume defaults', async () => {
-  for (const version of ['26.1', '26.1.1', '26.1.2']) {
+  for (const version of ['26.1', '26.1.2']) {
     const ordinary = rocket(32, null)
     assert.deepEqual(ordinary.components, [])
     assert.deepEqual(ordinary.removedComponents, [])
@@ -244,7 +244,7 @@ test('known 26.1 default component patches accept ordinary rockets; unknown vers
     assert.equal(guidance.rocketCount(h.bot), 32)
     assert.equal((await h.flight.fly(goal)).ok, true)
   }
-  for (const version of [undefined, null, '', '26.1.3', '1.21.11', 'unknown', 775]) {
+  for (const version of [undefined, null, '', '26.1.1', '26.1.3', '1.21.11', 'unknown', 775]) {
     assert.equal(guidance.validRocket(rocket(32, null), version), false)
     assert.equal(guidance.validRocket(rocket(), version), false)
   }
@@ -287,7 +287,7 @@ function nbtRocket(version, flight = 1, explosions) {
     } } } } }
 }
 
-for (const version of ['1.8.8', '1.12.2', '1.20.4']) {
+for (const version of ['1.8.8', '1.12.2']) {
   test(`${version} 实测形状的 NBT 只认时长 1 和无爆炸，生产版本门保持关闭`, () => {
     const probe = probeGuidance(), ordinary = nbtRocket(version), empty = { type: 'list', value: { type: 'compound', value: [] } }
     assert.equal(probe.validRocket(ordinary, version), true)
@@ -306,6 +306,20 @@ for (const version of ['1.8.8', '1.12.2', '1.20.4']) {
     }
     assert.equal(probe.validRocket({ ...ordinary, name: ordinary.name === 'fireworks' ? 'firework_rocket' : 'fireworks' }, version), false)
     for (const count of [0, -1, 65, 1.5, '2', NaN]) assert.equal(probe.validRocket({ ...ordinary, count }, version), false)
+  })
+}
+
+for (const version of ['1.16.5', '1.20.4']) {
+  test(`${version} 的真实 NBT Slot 只认显式时长 1 和无爆炸`, () => {
+    const data = require('minecraft-data')(version), VersionItem = require('prismarine-item')(version)
+    const makeRocket = nbtData => VersionItem.fromNotch({ present: true, itemId: data.itemsByName.firework_rocket.id, itemCount: 2, nbtData })
+    const valid = makeRocket(nbtRocket(version).nbt)
+    assert.equal(guidance.validRocket(valid, version), true)
+    assert.equal(guidance.rocketCount({ version, inventory: { items: () => [valid] } }), 2)
+    assert.equal(guidance.validRocket(makeRocket(null), version), false)
+    assert.equal(guidance.validRocket(makeRocket(nbtRocket(version, 2).nbt), version), false)
+    const explosive = { type: 'list', value: { type: 'compound', value: [{}] } }
+    assert.equal(guidance.validRocket(makeRocket(nbtRocket(version, 1, explosive).nbt), version), false)
   })
 }
 

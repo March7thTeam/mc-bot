@@ -8,12 +8,14 @@ const { randomBytes } = require('node:crypto')
 const { spawn, execFile } = require('node:child_process')
 const { promisify } = require('node:util')
 const mcData = require('minecraft-data')
+const { ping } = require('minecraft-protocol')
 const mineflayer = require('mineflayer')
 const { Vec3 } = require('vec3')
 const { rconRun } = require('../../rcon')
 const { versionFacts, flightVerified, compareRelease } = require('../../versions')
 const runFile = promisify(execFile)
 const ROOT = path.resolve(__dirname, '../..'), NAME = 'VersionLabBot', TESTER = 'VersionTester'
+const ZOMBIE_SCORE = 'vm_zombie_kills'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const assert = (condition, message) => { if (!condition) throw new Error(message) }
 
@@ -71,6 +73,8 @@ function commandsFor(version) {
     mobRule: compareRelease(version, '1.21.11') >= 0 ? 'spawn_mobs' : 'doMobSpawning',
     inventoryRule: compareRelease(version, '1.21.11') >= 0 ? 'keep_inventory' : 'keepInventory',
     forceload: compareRelease(version, '1.14') >= 0,
+    zombieCriterion: modern ? 'minecraft.killed:minecraft.zombie' : 'stat.killEntity.Zombie',
+    readZombieScore: modern ? `scoreboard players get ${NAME} ${ZOMBIE_SCORE}` : `scoreboard players list ${NAME}`,
     summon: (x, y, z, tag) => {
       assert(zombie, `${version} 注册表没有僵尸，无法执行召唤检查`)
       return `summon ${zombie} ${x} ${y} ${z} {CustomName:${modern ? JSON.stringify(JSON.stringify(tag)) : JSON.stringify(tag)},PersistenceRequired:1b,NoAI:1b,Health:20.0f}`
@@ -79,6 +83,15 @@ function commandsFor(version) {
     rocketGive: () => facts.components ? give(rocket, 64, '[minecraft:fireworks={flight_duration:1,explosions:[]}]')
       : give(rocket, 64, '{Fireworks:{Flight:1b}}'),
   }
+}
+
+function parseZombieScore(reply, modern) {
+  const clean = reply.replace(/\x1b\[[0-9;]*m|§[0-9a-fklmnor]/gi, '').trim()
+  const pattern = modern ? /^VersionLabBot has (\d+) \[vm_zombie_kills\]$/g
+    : /(?:^|[\s-])vm_zombie_kills:\s*(\d+)\s+\(vm_zombie_kills\)(?=\s|$|-)/g
+  const values = [...clean.matchAll(pattern)]
+  assert(values.length === 1 && Number.isSafeInteger(Number(values[0][1])), `僵尸计分板回执不对：${reply.trim().slice(0, 300)}`)
+  return Number(values[0][1])
 }
 
 // inv 最多分四条回复，物品名使用当前注册表的原名（旧版原木为 log）。
@@ -125,17 +138,19 @@ async function runVersion(version, options, control) {
   const c = commandsFor(version), container = `mc-bot-version-lab-${version.replace(/\./g, '-')}-${randomBytes(4).toString('hex')}`
   const password = randomBytes(24).toString('hex'), results = [], chat = [], deaths = new Set(), gone = new Set()
   let sandbox, child, tester, log = '', serverLog = '', exited = false, unexpectedExit = false, cleaning = null
+  let testerDisconnected = false, testerClosing = false
   const docker = (...args) => runFile('docker', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })
   const readServerLog = async () => { const output = await docker('logs', container); return output.stdout + output.stderr }
   const rcon = (...commands) => rconRun({ host: '127.0.0.1', port: options.port + 1, password }, commands)
+  const rconReply = async command => (await docker('exec', container, 'rcon-cli', command)).stdout
   const checkLive = () => {
     assert(!control.stopping, '用户中断')
     assert(!exited, '被测机器人提前退出')
-    assert(!tester?._client?.ended, '测试账号已断开')
+    assert(!testerDisconnected, '测试账号已断开')
   }
-  async function waitFor(predicate, timeout = 30_000, description = '条件') {
+  async function waitFor(predicate, timeout = 30_000, description = '条件', interval = 200) {
     const deadline = Date.now() + timeout
-    do { checkLive(); const value = await predicate(); if (value) return value; await sleep(200) } while (Date.now() < deadline)
+    do { checkLive(); const value = await predicate(); if (value) return value; await sleep(interval) } while (Date.now() < deadline)
     throw new Error(`等待${description}超时（${timeout / 1000} 秒）`)
   }
   async function check(id, name, fn) {
@@ -148,6 +163,7 @@ async function runVersion(version, options, control) {
     console.log(`[matrix] ${version} ${results.at(-1).status} ${name}`)
   }
   const entity = () => Object.values(tester?.entities || {}).find((entry) => entry.username === NAME)
+  const detectedVersion = () => log.match(/\[version\] ([\d.]+)：/)?.[1]
   const position = () => { const p = entity()?.position; return p ? { x: p.x, y: p.y, z: p.z } : null }
   const distance = (a, b) => a && b ? Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) : Infinity
   async function command(text, pattern, timeout = 30_000) {
@@ -178,10 +194,21 @@ async function runVersion(version, options, control) {
     await rcon(`clear ${NAME}`, `tp ${NAME} 0.5 100 0.5`, `tp ${TESTER} -4.5 100 0.5`, 'time set 18000', 'weather clear')
     await waitFor(() => distance(position(), { x: 0.5, y: 100, z: 0.5 }) < 1, 15_000, '机器人回场')
   }
+  function closeTester() {
+    if (!tester || testerClosing) return
+    testerClosing = true
+    try {
+      if (tester.quit) tester.quit()
+      else tester._client?.end?.('matrix complete')
+    } catch (err) {
+      log += `[tester] 关闭失败：${err.message}\n`
+      tester._client?.socket?.destroy()
+    }
+  }
   async function cleanup() {
     if (cleaning) return cleaning
     cleaning = (async () => {
-      tester?.quit()
+      closeTester()
       if (child && !exited) {
         child.kill('SIGTERM')
         for (let i = 0; i < 25 && !exited; i++) await sleep(200)
@@ -195,7 +222,7 @@ async function runVersion(version, options, control) {
     })()
     return cleaning
   }
-  control.interrupt = () => { child?.kill('SIGTERM'); tester?.quit() }
+  control.interrupt = () => { child?.kill('SIGTERM'); closeTester() }
   try {
     // 每轮独占随机实验容器名，清理只处理这一轮启动的容器。
     checkLive()
@@ -207,12 +234,19 @@ async function runVersion(version, options, control) {
       serverLog = await readServerLog()
       return serverLog.includes('Done (')
     }, 360_000, '服务器启动')
+    await waitFor(async () => {
+      try {
+        const status = await ping({ host: '127.0.0.1', port: options.port, version, closeTimeout: 3000, noPongTimeout: 500 })
+        return status.version?.protocol === c.registry.version.version
+      } catch { return false }
+    }, 30_000, '游戏端口返回目标协议')
     sandbox = await copySandbox(options.out)
-    tester = mineflayer.createBot({ host: '127.0.0.1', port: options.port, username: TESTER, auth: 'offline', version: false, viewDistance: 'short' })
+    tester = mineflayer.createBot({ host: '127.0.0.1', port: options.port, username: TESTER, auth: 'offline', version, viewDistance: 'short' })
     let testerSpawned = false
     tester.physicsEnabled = false
     tester.once('spawn', () => { tester.physicsEnabled = false; testerSpawned = true })
     tester.on('error', (err) => { log += `[tester] ${err.message}\n` })
+    tester.once('end', () => { testerDisconnected = true })
     tester.on('kicked', (reason) => { log += `[tester] 被踢：${JSON.stringify(reason)}\n` })
     tester.on('chat', (user, text) => { if (user === NAME) chat.push({ at: Date.now(), text }) })
     tester.on('entityDead', (entry) => deaths.add(entry.id))
@@ -236,7 +270,7 @@ async function runVersion(version, options, control) {
     await rcon(`tp ${TESTER} -4.5 100 0.5`, `tp ${NAME} 0.5 100 0.5`)
     await waitFor(() => distance(position(), { x: 0.5, y: 100, z: 0.5 }) < 2, 15_000, '测试账号看到机器人回场')
     await check(1, '自动检测版本', async () => {
-      const detected = log.match(/\[version\] ([\d.]+)：/)?.[1]
+      const detected = detectedVersion()
       assert(detected && mcData(detected)?.version.version === c.registry.version.version, `请求 ${version}，日志检测 ${detected}`)
       assert(tester.registry.version.version === c.registry.version.version, `测试账号检测成 ${tester.version}`)
       return { requested: version, detected, tester: tester.version, protocol: c.registry.version.version }
@@ -286,23 +320,29 @@ async function runVersion(version, options, control) {
       assert(c.registry.itemsByName.iron_sword, `${version} 注册表没有铁剑（iron_sword）`)
       await rcon(c.give('iron_sword'))
       assert(await inventoryCount('iron_sword') >= 1, `${version} 铁剑发放失败，机器人背包没有 iron_sword`)
-      const ids = new Set(Object.keys(tester.entities)), logBefore = await readServerLog(), tag = 'VmZombie'
+      await rconReply(`scoreboard objectives add ${ZOMBIE_SCORE} ${c.zombieCriterion}`)
+      await rconReply(`scoreboard players set ${NAME} ${ZOMBIE_SCORE} 0`)
+      const score = async () => parseZombieScore(await rconReply(c.readZombieScore), c.modern)
+      const before = await score()
+      assert(before === 0, `僵尸计分板初始值是 ${before}`)
+      const ids = new Set(Object.keys(tester.entities)), tag = 'VmZombie'
       const summon = c.summon(4.5, 100, 0.5, tag)
       await rcon(summon)
       let zombie
       try {
         zombie = await waitFor(() => Object.values(tester.entities).find((entry) => !ids.has(String(entry.id)) && entry.name?.toLowerCase() === c.zombie.toLowerCase()), 10_000, '僵尸出现')
       } catch (err) { throw new Error(`${version} 僵尸召唤失败，未观察到实体；指令：${summon}；${err.message}`) }
-      await command('bot guard on', /自卫已开/)
-      const evidence = await waitFor(async () => {
-        const after = (await readServerLog()).slice(logBefore.length)
-        const lines = after.split('\n')
-        const death = lines.find(line => line.includes(tag) && line.includes(`was slain by ${NAME}`))
-        const achievement = lines.find(line => line.includes(NAME) && line.includes('[Monster Hunter]'))
-        if (death || (achievement && (deaths.has(zombie.id) || gone.has(zombie.id)))) return { death, achievement }
-      }, 30_000, '本轮僵尸死亡及机器人击杀证据')
-      await command('bot guard off', /关|停|不再/)
-      return { entity: zombie.id, deathEvent: deaths.has(zombie.id), gone: gone.has(zombie.id), ...evidence }
+      try {
+        await command('bot guard on', /自卫已开/)
+        const after = await waitFor(async () => {
+          const value = await score()
+          assert(value <= before + 1, `本轮击杀计数意外增加到 ${value}`)
+          return value === before + 1 ? value : false
+        }, 30_000, '服务器确认机器人击杀一只僵尸', 600)
+        return { entity: zombie.id, deathEvent: deaths.has(zombie.id), gone: gone.has(zombie.id), criterion: c.zombieCriterion, before, after }
+      } finally {
+        if (!exited && !testerDisconnected && !control.stopping) await command('bot guard off', /自卫已关/, 6000).catch(err => { log += `[matrix] ${err.message}\n` })
+      }
     })
     await check(8, 'come 走到测试账号四格内', async () => {
       await reset()
@@ -329,7 +369,9 @@ async function runVersion(version, options, control) {
     })
     if (options.flight) await check(11, '四百格自动交通与飞行证据', async () => {
       await reset()
-      const verified = flightVerified(version), targetX = 400.5, targetZ = 0.5
+      const detected = detectedVersion()
+      assert(detected, '没有机器人版本检测回执，无法验证自动交通')
+      const verified = flightVerified(detected), targetX = 400.5, targetZ = 0.5
       if (c.facts.elytra) await rcon(c.give(c.name('elytra')), c.rocketGive())
       if (!verified) {
         // 非白名单只观察场地上的交通选择，及时停下，不要求走完四百格。
@@ -339,7 +381,7 @@ async function runVersion(version, options, control) {
         const rocketsAfter = c.facts.elytra ? await inventoryCount(c.facts.rocketItem) : 0
         const lines = log.slice(mark), replies = chat.slice(start)
         const walking = replies.some((entry) => /步行/.test(entry.text)), usedFlight = /\[flight\].*CLIMB/.test(lines)
-        const details = { verified, elytraAvailable: c.facts.elytra, target: { x: targetX, y: 100, z: targetZ },
+        const details = { detected, verified, elytraAvailable: c.facts.elytra, target: { x: targetX, y: 100, z: targetZ },
           walking, usedFlight, rocketsBefore, rocketsAfter, replies, log: lines, stopped: position() }
         if (!walking || usedFlight || rocketsBefore !== rocketsAfter) throw Object.assign(new Error('非白名单步行选择或火箭核验失败'), { details })
         return details
@@ -388,7 +430,7 @@ async function runVersion(version, options, control) {
       const usedFlight = /\[flight\].*(?:CLIMB|CRUISE)/.test(lines)
       const flightReceipt = replies.some((entry) => /到了 .*使用鞘翅/.test(entry.text))
       const walking = replies.some((entry) => /到了 .*步行/.test(entry.text))
-      const details = { verified, elytraAvailable: c.facts.elytra, highStart, target: { x: targetX, y: targetY, z: targetZ }, reached,
+      const details = { detected, verified, elytraAvailable: c.facts.elytra, highStart, target: { x: targetX, y: targetY, z: targetZ }, reached,
         usedFlight, flightReceipt, walking, rocketsBefore, rocketsAfter, replies, observed, log: lines, failure }
       if (failure || !reached || !usedFlight || !flightReceipt || rocketsAfter >= rocketsBefore) {
         throw Object.assign(new Error('自动交通未通过'), { details })
@@ -439,4 +481,4 @@ async function main(args = process.argv.slice(2)) {
 }
 
 if (require.main === module) main().catch((err) => { console.error(`[matrix] ${err.message}`); process.exitCode = 1 })
-module.exports = { parseArgs, includeFile, commandsFor, parseInventoryCount, prepareArena }
+module.exports = { parseArgs, includeFile, commandsFor, parseInventoryCount, parseZombieScore, prepareArena }
