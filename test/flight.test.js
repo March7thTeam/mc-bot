@@ -309,13 +309,14 @@ for (const version of ['1.8.8', '1.12.2', '1.20.4']) {
   })
 }
 
-test('1.21.4 实测组件空补丁和显式时长分开处理，白名单仍拒绝', () => {
-  const probe = probeGuidance()
-  assert.equal(probe.validRocket(rocket(2, null), '1.21.4'), true)
-  assert.equal(probe.validRocket(rocket(2), '1.21.4'), true)
-  assert.equal(probe.validRocket(rocket(2, { flightDuration: 3, explosions: [] }), '1.21.4'), false)
-  assert.equal(probe.validRocket(rocket(2, { flightDuration: 1, explosions: [{}] }), '1.21.4'), false)
-  assert.equal(guidance.validRocket(rocket(2, null), '1.21.4'), false)
+test('1.21.4 原版组件空补丁和显式时长 1 可以使用，其余时长或爆炸拒绝', () => {
+  const version = '1.21.4', data = require('minecraft-data')(version), VersionItem = require('prismarine-item')(version)
+  const makeRocket = (fireworks) => VersionItem.fromNotch({ itemId: data.itemsByName.firework_rocket.id, itemCount: 2,
+    components: fireworks ? [{ type: 'fireworks', data: fireworks }] : [], removeComponents: [] })
+  assert.equal(guidance.validRocket(makeRocket(), version), true)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 1, explosions: [] }), version), true)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 3, explosions: [] }), version), false)
+  assert.equal(guidance.validRocket(makeRocket({ flightDuration: 1, explosions: [{}] }), version), false)
   assert.equal(guidance.validRocket(nbtRocket('1.20.4'), '26.1'), false)
 })
 

@@ -53,7 +53,7 @@
 
 ## 火箭格式与飞行白名单
 
-`flightVerified(version)` 只读取常量集合，当前为 `26.1`、`26.1.1`、`26.1.2`。它表达项目的人工实测准入，不能从协议支持、拥有鞘翅、火箭格式可解析或单元测试通过推导出来，也不表示本次重新验证了这三个版本。
+`flightVerified(version)` 当前允许 `1.21.4`、`26.1`、`26.1.1` 和 `26.1.2`。准入按具体版本人工验收。1.21.4 的隔离原版服先用 140 格路线验证起飞、降落和末段步行，再以 400 格路线验证巡航和到达。两次分别消耗 1 枚和 3 枚烟花。
 
 - 组件格式沿用已有一致性检查：`componentMap`、原始组件数组、移除组件列表必须齐全；拒绝被移除、重复、命名冲突、原始值与 Map 不一致的烟花组件。原版默认的空补丁表示 Flight 1、无爆炸；显式覆盖也必须是 `flightDuration: 1` 和空 `explosions`。
 - NBT 格式只认 `nbt.value.Fireworks.value.Flight.value === 1`，同时验证 compound/byte 结构；`Explosions` 缺失或是空的 compound/end 列表才通过。`nbt: null` 是默认 Flight 0，拒绝使用。1.13 前物品叫 `fireworks`，之后叫 `firework_rocket`。

@@ -72,7 +72,7 @@ function installLegacyAliases(registry, facts) {
   return added
 }
 
-const VERIFIED_FLIGHT = new Set(['26.1', '26.1.1', '26.1.2'])
+const VERIFIED_FLIGHT = new Set(['1.21.4', '26.1', '26.1.1', '26.1.2'])
 const flightVerified = (version) => VERIFIED_FLIGHT.has(version)
 
 module.exports = { versionFacts, describeVersion, installLegacyAliases, flightVerified, releaseOf, compareRelease, LEGACY_ALIASES }

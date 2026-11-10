@@ -75,9 +75,9 @@ test('别名不覆盖现有键，现代注册表不加别名，缺失旧名不�
   assert.equal(registry.itemsByName.oak_boat, undefined)
 })
 
-test('自动飞行白名单只含人工指定的三个版本', () => {
-  for (const version of ['26.1', '26.1.1', '26.1.2']) assert.equal(flightVerified(version), true)
-  for (const version of ['1.8.8', '1.12.2', '1.20.4', '1.21.4', '26.1.3', undefined, null, 775]) assert.equal(flightVerified(version), false)
+test('自动飞行按已验收的具体版本放行', () => {
+  for (const version of ['1.21.4', '26.1', '26.1.1', '26.1.2']) assert.equal(flightVerified(version), true)
+  for (const version of ['1.8.8', '1.12.2', '1.20.4', '1.21.3', '1.21.5', '26.1.3', undefined, null, 775]) assert.equal(flightVerified(version), false)
 })
 
 for (const version of ['1.8.8', '1.12.2']) {
