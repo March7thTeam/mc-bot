@@ -146,6 +146,16 @@ function createRuntime({ timeoutMs = 180_000, onTimeout = () => {}, onPreempt = 
     }
     guard(bot, ['equip', 'craft', 'toss', 'tossStack', 'consume', 'sleep', 'placeBlock', 'dig',
       'attack', 'activateItem', 'elytraFly', 'clickWindow', 'transfer', 'moveSlotItem'])
+    // Local movement flags can outlive the old promise and drive the new world's physics.
+    for (const name of ['setControlState', 'clearControlStates', 'look', 'lookAt']) {
+      const original = bot[name]
+      if (typeof original !== 'function') continue
+      bot[name] = function (...args) {
+        const scope = storage.getStore()
+        if (!scope || scope.worldEpoch === worldEpoch) return original.apply(this, args)
+        if (name === 'look' || name === 'lookAt') return Promise.resolve()
+      }
+    }
     guard(bot.pathfinder, ['goto', 'setGoal', 'setMovements'])
     guard(bot.collectBlock, ['collect'])
     guard(bot.pvp, ['attack'])

@@ -188,7 +188,7 @@ async function runVersion(version, options, control) {
         if (!exited) { child.kill('SIGKILL'); await new Promise((resolve) => child.once('exit', resolve)) }
       }
       try { serverLog = await readServerLog() } catch (err) { serverLog += `\n读取服务器日志失败：${err.message}` }
-      try { await docker('rm', '-f', container) } catch (err) {
+      try { await docker('rm', '-f', '-v', container) } catch (err) {
         if (!/No such container/i.test(err.stderr || '')) results.push({ id: 'cleanup', name: '删除测试容器', status: 'FAIL', details: err.message })
       }
       if (sandbox) await fs.rm(sandbox, { recursive: true, force: true }).catch((err) => results.push({ id: 'sandbox', name: '删除临时副本', status: 'FAIL', details: err.message }))

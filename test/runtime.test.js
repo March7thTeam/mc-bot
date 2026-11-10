@@ -63,6 +63,21 @@ test('跨维度后旧容器的迟到打开、关闭和协议包不能碰新窗�
   assert.deepEqual(sent, ['new'])
 })
 
+test('跨维度的晚到控制和朝向不会继续改变新世界物理', async () => {
+  const runtime = createRuntime(), controls = []
+  const bot = { setControlState: (...args) => controls.push(args), clearControlStates: () => controls.push('clear'), look: async () => controls.push('look') }
+  runtime.guardBot(bot)
+  await runtime.scope(async () => {
+    bot.setControlState('forward', true)
+    runtime.cancel('dimension changed', 'dimension_changed')
+    await bot.look(0, 0)
+    bot.setControlState('jump', true)
+    bot.clearControlStates()
+  })
+  await runtime.scope(() => bot.look(0, 0))
+  assert.deepEqual(controls, [['forward', true], 'look'])
+})
+
 test('熔炉续操作、寻路及攻击同样受取消约束', async () => {
   const runtime = createRuntime()
   let mutations = 0
