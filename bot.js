@@ -72,6 +72,16 @@ const bot = mineflayer.createBot({
   hideErrors: true, // 下面的 error 监听已记一行；默认还会再打整段堆栈，服务器关着时每次重启刷十几行
 })
 
+let levelName = null
+const dimension = () => levelName ?? bot.game?.dimension
+// Mineflayer 的 game 事件可能只带维度类型。同类型的自定义世界仍有独立的 level name。
+function readLevelName(packet) {
+  const name = packet.worldState?.name ?? packet.worldName
+  levelName = typeof name === 'string' && name ? name.replace(/^minecraft:/, '') : null
+}
+bot._client?.prependListener('login', readLevelName)
+bot._client?.prependListener('respawn', readLevelName)
+
 // Fabric 服在配置阶段同步注册表：按里面出现的命名空间启用模组扩展，并给模组物品组件登记编码
 setupFabric(bot, { version: VERSION || undefined, onRegistries: (namespaces) => { mods.activate(namespaces); return mods.componentCodecs() } })
 bot.once('login', () => {
@@ -1059,6 +1069,7 @@ const commands = {
 // ---- 进阶指令和常驻模式（skills.js / modes.js）----
 const ctx = {
   travelTimeout, behindIsSafe, isDropAt,
+  dimension,
   travelTo: (...args) => autoTravel.travelTo(...args),
   say, runTask, travel, sleepMs, fmt, craftItem, placeNearby, equipWeapon, resume: resumeIdle,
   alias: (n) => Object.hasOwn(ALIASES, n) ? ALIASES[n] : n,
@@ -1127,7 +1138,40 @@ function makeFlight() {
   return engine
 }
 flight = makeFlight()
-bot.on('spawn', () => { flight.dispose('respawn'); flight = makeFlight() })
+let lastDimension
+function handleDimension() {
+  const next = dimension()
+  if (!next || next === lastDimension) return
+  const previous = lastDimension
+  lastDimension = next
+  if (!previous || !safeMoves) return
+  console.log(`[world] ${previous} → ${next}，取消旧维度任务`)
+  runtime.cancel('维度变化，旧任务已取消', 'dimension_changed')
+  actionRun++
+  ai?.cancel()
+  if (goal || restoringGoal) saveGoal(null)
+  goal = restoringGoal = null
+  followTarget = post = task = null
+  queue.length = 0
+  companion.resetFollow()
+  flight.dispose('dimension_changed')
+  flight = makeFlight()
+  stopTaskControls('dimension_changed')
+  runtime.unscoped(() => {
+    const oldWindow = bot.currentWindow
+    if (oldWindow) {
+      // A protocol close from the old level could use the new level's window id.
+      bot.currentWindow = null
+      oldWindow.emit?.('close')
+      bot.emit('windowClose', oldWindow)
+    }
+    combat.stop()
+    bot.pathfinder.setMovements(safeMoves)
+  })
+}
+bot.on('game', handleDimension)
+bot.on('respawn', handleDimension)
+bot.on('spawn', () => { handleDimension(); flight.dispose('respawn'); flight = makeFlight() })
 commands.fly = (_user, args) => {
   if (eating || combat.active() || bot.currentWindow) return say('先等吃饭、战斗或容器操作结束再起飞')
   let target
@@ -1135,7 +1179,7 @@ commands.fly = (_user, args) => {
     const name = args[0]
     const place = skills.places && Object.hasOwn(skills.places, name) && skills.places[name]
     if (!place) return say('没有这个地点，先 bot mark 记录；步行仍可用 bot goto')
-    if (place.dim && place.dim !== bot.game.dimension) return say('地点不在当前维度')
+    if (place.dim && place.dim !== dimension()) return say('地点不在当前维度')
     target = { x: place.x, y: place.y, z: place.z }
   } else if (args.length === 2) {
     const [x, z] = args.map(Number) // 不给高度：落在那里的地面上
@@ -1363,6 +1407,7 @@ const TRAVEL_REASON = {
 }
 autoTravel = createAutoTravel(bot, {
   assertActive: runtime.assertActive, delay: runtime.delay,
+  dimension,
   getFlight: () => flight,
   ready: () => ({ ok: !eating && !combat.active() && !bot.currentWindow && !bot.isSleeping,
     reason: eating ? 'eating' : combat.active() ? 'combat' : bot.currentWindow ? 'container_open' : bot.isSleeping ? 'sleeping' : null }),
@@ -1391,7 +1436,7 @@ commands.walk = (_user, args) => {
   if (args.length === 1) {
     const place = Object.hasOwn(skills.places, args[0]) && skills.places[args[0]]
     if (!place) { say('没有这个地点'); return { ok: false, error: '没有这个地点' } }
-    if (place.dim && place.dim !== bot.game.dimension) { say('地点不在当前维度'); return { ok: false, error: '地点不在当前维度' } }
+    if (place.dim && place.dim !== dimension()) { say('地点不在当前维度'); return { ok: false, error: '地点不在当前维度' } }
     target = { x: place.x, y: place.y, z: place.z }
   } else {
     const [x, y, z] = args.map(Number)
@@ -1404,7 +1449,7 @@ commands.walk = (_user, args) => {
   }, { timeoutMs: travelTimeout(target.x, target.z) })
 }
 const companion = createCompanion(bot, {
-  say, log: (...args) => console.log(...args),
+  say, dimension, log: (...args) => console.log(...args),
   getFollow: () => followTarget && ({ name: followTarget, distance: followDistance }),
   paused: () => runtime.busy() || combat.active() || eating || !!flight?.active(),
   followEntity: (entity, distance) => { bot.pathfinder.setMovements(safeMoves); bot.pathfinder.setGoal(new goals.GoalFollow(entity, distance), true) },
@@ -1488,7 +1533,7 @@ const recentActions = []
 const remember = (list, line, max) => { list.push(String(line).slice(0, 200)); if (list.length > max) list.shift() }
 function describeState(user = currentRequester, query = '') {
   const lessons = query ? experience.recall(goal?.text || query).join('；').slice(0, 500) : ''
-  const stored = bot.entity ? ctx.containers.describe(bot.game?.dimension || 'unknown', bot.entity.position, `${goal?.text || ''} ${query}`).slice(0, 500) : ''
+  const stored = bot.entity ? ctx.containers.describe(dimension() || 'unknown', bot.entity.position, `${goal?.text || ''} ${query}`).slice(0, 500) : ''
   const p = bot.entity?.position
   const time = bot.time?.timeOfDay
   return [
@@ -2320,7 +2365,7 @@ function startAgentApi() {
       port: Number(process.env.MC_AGENT_PORT), host: process.env.MC_AGENT_HOST || '127.0.0.1', token: process.env.MC_AGENT_TOKEN, events: agentEvents,
       handlers: {
         state: () => ({
-          username: bot.username, version: bot.version, brand: bot.game?.serverBrand || null, dimension: bot.game?.dimension,
+          username: bot.username, version: bot.version, brand: bot.game?.serverBrand || null, dimension: dimension(),
           position: bot.entity && { x: +bot.entity.position.x.toFixed(1), y: +bot.entity.position.y.toFixed(1), z: +bot.entity.position.z.toFixed(1) },
           health: bot.health, food: bot.food, night: isNight(), busy: busyReason(), queue: queue.length,
           inventory: bot.inventory.items().map((i) => ({ name: i.name, count: i.count })),

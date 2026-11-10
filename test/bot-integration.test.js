@@ -16,7 +16,7 @@ const cleanup = (t, h, ...waits) => t.after(async () => {
   await flush()
 })
 
-function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions, env = {}, savedGoal, agentApi = false, realSkills = false } = {}) {
+function harness({ ask = async () => ({ reply: '', actions: [], done: false }), taskWait, flightWait, routeHook, fastGoalDelays = false, extensions, env = {}, savedGoal, agentApi = false, realSkills = false, configureBot } = {}) {
   const sent = [], marks = [], calls = [], logs = [], movements = []
   const engines = []
   let apiHandlers = null
@@ -33,6 +33,7 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
     stopDigging() {}, clearControlStates() {}, equip: () => calls.push('equip'), quit() {},
     look: async (...args) => calls.push(['look', ...args]), elytraFly: async () => calls.push('glide'),
   })
+  configureBot?.(bot)
   class Movements {
     constructor() { this.canDig = true; this.blocksCantBreak = new Set(); this.exclusionAreasPlace = []; this.scafoldingBlocks = []; this.liquids = new Set() }
     getNeighbors() { return [] }
@@ -98,7 +99,10 @@ function harness({ ask = async () => ({ reply: '', actions: [], done: false }), 
   })
   const loadWithTestStorage = (name) => vm.runInContext(`(() => { const module = { exports: {} }; ${fs.readFileSync(path.join(root, `${name}.js`), 'utf8')}\nreturn module.exports })()`, context)
   mods['./experience'] = loadWithTestStorage('experience')
-  if (realSkills) mods['./skills'] = loadWithTestStorage('skills')
+  if (realSkills) {
+    mods['./skills'] = loadWithTestStorage('skills')
+    mods['./containers'] = loadWithTestStorage('containers')
+  }
   vm.runInContext(fs.readFileSync(path.join(root, 'bot.js'), 'utf8'), context, { filename: 'bot.js' })
   if (agentApi) vm.runInContext('startAgentApi()', context)
   bot.emit('spawn')
@@ -163,6 +167,96 @@ test('go 在真实技能、execStep 和 API 回执中拒绝未知或跨维度地
   h.bot.game.dimension = 'overworld'
   assert.equal((await h.apiHandlers.command({ cmd: 'go', args: ['家'], wait: true })).ok, true)
   assert.equal(h.calls.filter(c => c[0] === 'travelTo').length, 1)
+})
+
+test('同类型的不同 level 同步取消旧任务，普通 game 和重复 respawn 不会取消', async (t) => {
+  const taskWait = deferred()
+  const h = harness({ taskWait, configureBot(bot) {
+    bot._client = new EventEmitter()
+    bot._client.on('respawn', () => { bot.emit('game'); bot.emit('respawn') })
+  } })
+  cleanup(t, h, taskWait)
+  const runtime = h.inner('runtime')
+  const generation = runtime.generation()
+  h.bot.emit('chat', 'Player', 'bot smelt iron_ingot')
+  await flush()
+  h.bot.emit('game')
+  h.bot._client.emit('respawn', { worldState: { name: 'minecraft:overworld' } })
+  assert.equal(runtime.generation(), generation)
+  h.bot._client.emit('respawn', { worldState: { name: 'custom:other_overworld' } })
+  assert.equal(runtime.generation(), generation + 1)
+  h.bot.emit('spawn')
+  assert.equal(runtime.generation(), generation + 1)
+  taskWait.resolve()
+  await flush()
+  assert.ok(h.logs.includes('[task] end test cancelled=true'))
+  assert.ok(!h.calls.includes('equip'))
+  h.bot.emit('chat', 'Player', 'bot smelt iron_ingot')
+  await flush()
+  assert.ok(h.calls.includes('equip'))
+})
+
+test('维度切换取消未返回的 AI、首次跟随或已绑定跟随，以及旧站岗点', async (t) => {
+  for (const mode of ['ai', 'before_tick', 'after_tick', 'stay']) await t.test(mode, async t => {
+    const waiting = deferred(), h = harness({ ask: () => waiting.promise })
+    cleanup(t, h, waiting)
+    h.bot.players.Player = { entity: { id: 9, position: new Vec3(4, 64, 0) } }
+    if (mode === 'ai') h.bot.emit('chat', 'Player', 'bot 帮我记下位置')
+    else h.bot.emit('chat', 'Player', mode === 'stay' ? 'bot stay' : 'bot follow')
+    await flush()
+    if (mode === 'after_tick') h.inner('companion.tick()')
+    if (mode === 'stay') assert.ok(h.inner('post'))
+    if (mode.includes('tick')) assert.equal(h.inner('followTarget'), 'Player')
+    h.bot.game.dimension = 'the_nether'
+    h.bot.emit('game')
+    assert.equal(h.inner('followTarget'), null)
+    assert.equal(h.inner('post'), null)
+    assert.equal(h.bot.pathfinder.goal, null)
+    if (mode === 'ai') waiting.resolve({ actions: [{ cmd: 'mark', args: ['旧坐标'] }], done: true })
+    await flush()
+    assert.deepEqual(h.marks, [])
+    h.bot.emit('chat', 'Player', 'bot follow')
+    await flush()
+    h.inner('companion.tick()')
+    assert.equal(h.inner('followTarget'), 'Player')
+  })
+})
+
+test('旧箱窗口自动关闭或延迟 finally 都不影响新维度同坐标箱子', async t => {
+  for (const autoClose of [true, false]) await t.test(autoClose ? 'server close' : 'finally only', async t => {
+    const pending = deferred(), p = new Vec3(2, 64, 0), closed = []
+    const h = harness({ realSkills: true, agentApi: true, configureBot(bot) {
+      bot.registry.itemsByName = { dirt: { id: 1 }, stone: { id: 2 } }
+      bot.currentWindow = null
+      bot.findBlock = () => ({ position: p, name: 'chest' })
+      bot.openContainer = async () => {
+        const dim = bot.game.dimension
+        const chest = new EventEmitter()
+        Object.assign(chest, {
+          containerItems: () => [{ name: dim === 'overworld' ? 'dirt' : 'stone', count: 2 }],
+          inventoryStart: 27,
+          close() { closed.push(dim); bot.currentWindow = null },
+          withdraw: () => dim === 'overworld' ? pending.promise : Promise.resolve(),
+        })
+        return (bot.currentWindow = chest)
+      }
+    } })
+    cleanup(t, h, pending)
+    const old = h.apiHandlers.command({ cmd: 'withdraw', args: ['dirt'], wait: true })
+    await flush()
+    assert.ok(h.bot.currentWindow)
+    if (autoClose) { h.bot.emit('windowClose', h.bot.currentWindow); h.bot.currentWindow = null }
+    h.bot.game.dimension = 'the_nether'
+    h.bot.emit('game')
+    pending.resolve()
+    assert.equal((await old).stopped, true)
+    assert.equal((await h.apiHandlers.command({ cmd: 'withdraw', args: ['stone'], wait: true })).ok, true)
+    assert.deepEqual(closed, ['the_nether'])
+    const containers = h.inner('ctx.containers')
+    assert.equal(containers.find('dirt', 'the_nether', p).length, 0)
+    assert.equal(containers.find('dirt', 'overworld', p).length, 1)
+    assert.equal(containers.find('stone', 'the_nether', p).length, 1)
+  })
 })
 
 test('stop 在模型响应前到达时，真实调度器不执行旧回复或旧动作', async () => {

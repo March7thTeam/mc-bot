@@ -43,6 +43,26 @@ test('晚到的容器会关闭，已打开容器的后续存取受取消约束',
   assert.equal(transferred, 1)
 })
 
+test('跨维度后旧容器的迟到打开、关闭和协议包不能碰新窗口', async () => {
+  const runtime = createRuntime(), late = deferred(), sent = []
+  const old = { close: () => sent.push('old') }, next = { close: () => sent.push('new') }
+  const bot = { _client: { write: name => sent.push(name) }, currentWindow: old, openContainer: () => old, openFurnace: () => late.promise }
+  runtime.guardBot(bot)
+  await runtime.scope(async () => {
+    const opened = await bot.openContainer()
+    const pending = bot.openFurnace()
+    runtime.cancel('dimension changed', 'dimension_changed')
+    bot.currentWindow = next
+    late.resolve(next)
+    await assert.rejects(pending, { code: 'dimension_changed' })
+    opened.close()
+    bot._client.write('close_window')
+    assert.deepEqual(sent, [])
+  })
+  bot.currentWindow.close()
+  assert.deepEqual(sent, ['new'])
+})
+
 test('熔炉续操作、寻路及攻击同样受取消约束', async () => {
   const runtime = createRuntime()
   let mutations = 0

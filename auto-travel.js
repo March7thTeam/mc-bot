@@ -1,6 +1,7 @@
 'use strict'
 
 const guidance = require('./flight-guidance')
+const { CancelledError } = require('./runtime')
 
 // One place for automatic transport policy. Native flight owns long routes,
 // loaded-chunk waits and spare-elytra relays; there is no short-route ceiling.
@@ -27,10 +28,15 @@ function createAutoTravel(bot, ctx) {
     if (typeof ctx?.[key] !== 'function') throw new Error(`自动交通缺少 ${key}`)
   }
   let current = null, last = null
+  const dimension = ctx.dimension || (() => bot.game?.dimension)
+  function assertTravelActive() {
+    ctx.assertActive()
+    if (current && current.dimension !== dimension()) throw new CancelledError('维度变化，旧交通已取消', 'dimension_changed')
+  }
   // Recheck cancellation even when an awaited operation rejects. No inventory,
   // movement, success receipt or fallback may run after the old task ends.
   async function activeAwait(promise) {
-    try { return await promise } finally { ctx.assertActive() }
+    try { return await promise } finally { assertTravelActive() }
   }
   function arrived(target, range) {
     if (ctx.arrived) return !!ctx.arrived(target, range)
@@ -41,7 +47,7 @@ function createAutoTravel(bot, ctx) {
       Math.hypot(p.x - (x + 0.5), p.y - y, p.z - (z + 0.5)) <= range + 0.5
   }
   function ready() {
-    ctx.assertActive()
+    assertTravelActive()
     const value = ctx.ready()
     return value?.ok === true ? value : { ok: false, reason: value?.reason || 'controls_busy' }
   }
@@ -63,7 +69,7 @@ function createAutoTravel(bot, ctx) {
     }
   }
   function safeFallback(reason, landed) {
-    ctx.assertActive()
+    assertTravelActive()
     const e = bot.entity, engine = ctx.getFlight()
     return landed && !STOP.test(reason) && RECOVERABLE.has(reason) && stationary() &&
       !!engine && !engine.active() && ready().ok && Number.isFinite(bot.health) && bot.health >= POLICY.minHealth &&
@@ -102,7 +108,7 @@ function createAutoTravel(bot, ctx) {
     return null
   }
   function assess(target) {
-    ctx.assertActive()
+    assertTravelActive()
     const allowed = ready()
     if (!allowed.ok) return { ok: false, code: allowed.reason }
     const engine = ctx.getFlight()
@@ -121,7 +127,7 @@ function createAutoTravel(bot, ctx) {
     return { ...assessment, engine, candidate }
   }
   async function prepare(target, plan) {
-    ctx.assertActive()
+    assertTravelActive()
     if (!plan.ok) return plan
     if (ctx.getFlight() !== plan.engine || plan.engine.active()) return { ok: false, code: 'flight_changed' }
     if (!ready().ok) return { ok: false, code: 'controls_busy' }
@@ -130,7 +136,7 @@ function createAutoTravel(bot, ctx) {
       if (worn && worn.name !== 'elytra') return { ok: false, code: 'torso_occupied' }
       if (!guidance.inventoryItems(bot).includes(candidate)) return { ok: false, code: 'candidate_unavailable' }
       // Read the chest slot immediately before the only automatic equip.
-      ctx.assertActive()
+      assertTravelActive()
       if (torso(bot) !== worn) return { ok: false, code: 'torso_changed' }
       await activeAwait(bot.equip(candidate, 'torso'))
       if (ctx.getFlight() !== plan.engine) return { ok: false, code: 'flight_changed' }
@@ -154,11 +160,11 @@ function createAutoTravel(bot, ctx) {
     if (value?.finalApproach === 'walk' || value?.transport === 'hybrid') current.walked = true
   }
   function outcome(reason, fallbackReason) {
-    ctx.assertActive()
+    assertTravelActive()
     const reached = !STOP.test(reason) && arrived(current.target, current.range) &&
       (!current.flightAttempts || (current.flightConfirmed && groundedWithIdleFlight() &&
         (current.walkAfterLanding || stationary())))
-    const value = { kind: 'travel', ok: reached, reached, target: { ...current.target },
+    const value = { kind: 'travel', ok: reached, reached, dimension: current.dimension, target: { ...current.target },
       position: guidance.copyPosition(bot.entity?.position), modeRequested: current.modeRequested,
       modeChosen: current.flew ? 'fly' : 'walk', transport: current.flew ? (current.walked ? 'hybrid' : 'fly') : 'walk',
       reason: reached ? current.selectionReason : reason, rocketsUsed: current.rocketsUsed,
@@ -169,7 +175,7 @@ function createAutoTravel(bot, ctx) {
     return copy(value)
   }
   async function walk(target, range) {
-    ctx.assertActive()
+    assertTravelActive()
     const allowed = ready()
     if (!allowed.ok) throw Object.assign(new Error(allowed.reason), { code: allowed.reason })
     current.phase = 'WALKING'
@@ -181,7 +187,7 @@ function createAutoTravel(bot, ctx) {
   async function fly(target, range, plan, allowWalkFallback) {
     let prepared
     try { prepared = await activeAwait(prepare(target, plan)) } catch (error) {
-      ctx.assertActive()
+      assertTravelActive()
       prepared = { ok: false, code: failureCode(error) }
     }
     if (!prepared.ok) {
@@ -191,7 +197,7 @@ function createAutoTravel(bot, ctx) {
       // Before takeoff there is no airborne recovery. A failed equipment check
       // can safely choose walking, but still respects the current task guard.
       try { await activeAwait(walk(target, range)); return outcome('walk_incomplete', prepared.code) }
-      catch (error) { ctx.assertActive(); return outcome(failureCode(error), prepared.code) }
+      catch (error) { assertTravelActive(); return outcome(failureCode(error), prepared.code) }
     }
     current.phase = 'FLIGHT_REQUESTED'
     current.flightAttempts++
@@ -200,7 +206,7 @@ function createAutoTravel(bot, ctx) {
       result = await activeAwait(ctx.fly(target, { automatic: true, protectTorso: true, reportFinal: false, maxLegs: 8 }))
       account(result)
     } catch (error) {
-      ctx.assertActive()
+      assertTravelActive()
       account(error)
       thrown = true
       result = { reason: failureCode(error), landed: stationary() }
@@ -225,19 +231,19 @@ function createAutoTravel(bot, ctx) {
         await waitForWalkLanding()
         return outcome('approach_incomplete', reason)
       }
-      catch (error) { ctx.assertActive(); return outcome(failureCode(error), reason) }
+      catch (error) { assertTravelActive(); return outcome(failureCode(error), reason) }
     }
     // A thrown flight must be inactive and stably grounded before any fallback;
     // the gate above applies identically to returned and thrown outcomes.
     return outcome(thrown ? reason : reason === 'arrival' ? 'approach_incomplete' : reason, current.fallbackReason)
   }
   async function travelTo(target, { mode = 'auto', range = 2 } = {}) {
-    ctx.assertActive()
+    assertTravelActive()
     if (current) throw new Error('自动交通仍在执行')
     if (!['auto', 'walk'].includes(mode) || ![1, 2].includes(range) ||
         !target || ![target.x, target.y, target.z].every(Number.isFinite)) throw new Error('自动交通参数无效')
     if (!bot.entity?.position) throw new Error('玩家位置不可用')
-    current = { target: { x: target.x, y: target.y, z: target.z }, range, modeRequested: mode,
+    current = { dimension: dimension(), target: { x: target.x, y: target.y, z: target.z }, range, modeRequested: mode,
       phase: 'SELECTING', selectionReason: 'forced_walk', rocketsUsed: 0, flightLegs: 0, flightAttempts: 0,
       flew: false, walked: false, walkAfterLanding: false }
     try {
@@ -256,7 +262,7 @@ function createAutoTravel(bot, ctx) {
         await activeAwait(walk(target, range))
         return outcome('walk_incomplete', current.fallbackReason)
       } catch (error) {
-        ctx.assertActive()
+        assertTravelActive()
         // NoPath is the only walking failure that justifies a single alternative
         // transport attempt. Timeout, cancellation and control contention do not.
         if (mode === 'auto' && distance >= POLICY.walkBelow && error?.name === 'NoPath') {

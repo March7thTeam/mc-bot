@@ -75,6 +75,15 @@ test('near destinations walk without an assessment, equipment write or rocket; f
   assert.equal((await h.travel.travelTo(far, { mode: 'walk', range: 1 })).reason, 'forced_walk')
 })
 
+test('reaching identical XYZ in a different dimension cannot complete travel', async () => {
+  const h = harness({ walk(target, h) { h.ground(target); h.bot.game.dimension = 'the_nether' } })
+  await assert.rejects(h.travel.travelTo(near), { code: 'dimension_changed' })
+  assert.equal(h.travel.status().last, null)
+  const result = await h.travel.travelTo(near)
+  assert.equal(result.ok, true)
+  assert.equal(result.dimension, 'the_nether')
+})
+
 test('long trips choose native flight with protected automatic multi-leg options and cumulative receipts', async () => {
   const h = harness({ fly(target, h) {
     h.ground(target)

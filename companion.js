@@ -6,7 +6,7 @@ function createCompanion(bot, ctx) {
   let trackedEntity = null
   let death = null
   const position = (p) => p && ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) })
-  const dim = () => bot.game?.dimension || 'unknown'
+  const dim = () => ctx.dimension?.() || bot.game?.dimension || 'unknown'
   const items = () => bot.inventory?.items?.() || []
   const equipment = () => ['head', 'torso', 'legs', 'feet', 'off-hand'].map((part) => {
     const fallback = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 }
@@ -88,6 +88,7 @@ function createCompanion(bot, ctx) {
   }, 1000)
   timer?.unref?.()
   return { scan, advice, lastDeath, tick, status: () => tracking && { ...tracking },
+    resetFollow() { tracking = null; trackedEntity = null },
     dispose() { if (timer) clearInterval(timer); bot.removeListener('death', recordDeath); tracking = null; trackedEntity = null } }
 }
 
